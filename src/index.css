@@ -1,0 +1,51 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  /* Geometric Balance Theme Palettes */
+  --color-slate-950: #0F1115; /* Base App Canvas */
+  --color-slate-900: #161920; /* Panels and Sidebars background */
+  --color-slate-850: #1A1E26; /* Dark accented headers & tabs */
+  --color-slate-800: #1C2029; /* Precise borders */
+  --color-slate-700: #292F3D; /* Mid-tone borders / Highlight */
+  --color-slate-600: #475569; /* Muted texts and lines */
+
+  /* Blue-centric accents */
+  --color-cyan-400: #60a5fa; /* Focus / Active Blue */
+  --color-cyan-500: #3b82f6; /* Accent Blue primary */
+  --color-cyan-600: #2563eb; /* Dark Accent Blue */
+  --color-cyan-700: #1d4ed8;
+
+  --color-amber-400: #3b82f6; /* Sub-accents mapped to Blue for geometric cohesion */
+  --color-amber-500: #2563eb;
+
+  /* Typography override */
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+/* Base style enhancements for the Geometric Balance theme */
+body {
+  background-color: #0F1115;
+  color: #cbd5e1;
+  font-family: "Inter", sans-serif;
+}
+
+/* Custom thin scrollbar for that clean CAD interface feel */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0F1115;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #1C2029;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #292F3D;
+}

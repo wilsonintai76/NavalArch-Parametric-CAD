@@ -1,0 +1,6 @@
+{
+  "name": "NavalArch Parametric CAD",
+  "description": "Professional naval architecture CAD application for parametric hull design, real-time hydrostatics, GZ stability curves, Holtrop-Mennen resistance analysis, scripting, and cloud collaboration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
