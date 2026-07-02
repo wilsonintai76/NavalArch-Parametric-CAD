@@ -4,14 +4,26 @@
  */
 
 import React, { useState } from 'react';
-import { ResistanceAnalysis } from '../types';
+import { ResistanceAnalysis, HullParameters } from '../types';
 import { Gauge, Zap, Waves, Activity, Sparkles } from 'lucide-react';
+import {
+  ResponsiveContainer,
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  Tooltip,
+  Legend,
+  CartesianGrid,
+  ReferenceLine
+} from 'recharts';
 
 interface ResistancePanelProps {
   analysis: ResistanceAnalysis;
+  parameters?: HullParameters;
 }
 
-export default function ResistancePanel({ analysis }: ResistancePanelProps) {
+export default function ResistancePanel({ analysis, parameters }: ResistancePanelProps) {
   const [selectedSpeed, setSelectedSpeed] = useState<number>(analysis.designSpeedKnots);
   const [activeChart, setActiveChart] = useState<'resistance' | 'power'>('resistance');
 
@@ -137,8 +149,8 @@ export default function ResistancePanel({ analysis }: ResistancePanelProps) {
           </div>
         </div>
 
-        {/* SVG Curve Plot */}
-        <div className="flex flex-col justify-between" id="resistance_svg_plot">
+        {/* Recharts Curve Plot */}
+        <div className="flex flex-col justify-between" id="resistance_recharts_plot">
           <div className="bg-slate-950 p-4 rounded border border-slate-800 flex-1 flex flex-col justify-between min-h-[220px]">
             <div className="flex justify-between items-center mb-2">
               <span className="text-xs font-bold uppercase tracking-wider font-mono text-slate-200">
@@ -150,116 +162,88 @@ export default function ResistancePanel({ analysis }: ResistancePanelProps) {
               </span>
             </div>
 
-            <div className="relative flex-1 flex items-center justify-center">
-               <svg width="100%" height={height} viewBox={`0 0 ${width} ${height}`} className="overflow-visible">
-                {/* Horizontal grid lines */}
-                {[0, 5, 10, 15, 20, 25, 30].map(val => (
-                  <g key={`x-grid-${val}`}>
-                    <line
-                      x1={mapX(val)}
-                      y1={padding}
-                      x2={mapX(val)}
-                      y2={height - padding}
-                      stroke="#1C2029"
-                      strokeWidth="1"
+            <div className="relative flex-1 min-h-[180px] w-full" id="recharts_container">
+              <ResponsiveContainer width="100%" height={200}>
+                <LineChart
+                  data={speedData}
+                  margin={{ top: 10, right: 10, left: -25, bottom: 0 }}
+                >
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis
+                    dataKey="speedKnots"
+                    stroke="#64748b"
+                    fontSize={10}
+                    fontFamily="monospace"
+                  />
+                  <YAxis
+                    stroke="#64748b"
+                    fontSize={10}
+                    fontFamily="monospace"
+                  />
+                  <Tooltip
+                    content={({ active, payload, label }: any) => {
+                      if (active && payload && payload.length) {
+                        return (
+                          <div className="bg-slate-950 border border-slate-800 p-3 rounded-lg shadow-xl font-mono text-xs space-y-1">
+                            <div className="text-slate-400 font-bold uppercase tracking-wider text-[10px]">Speed: {label} Knots</div>
+                            {payload.map((pld: any) => (
+                              <div key={pld.name} className="flex justify-between space-x-4">
+                                <span style={{ color: pld.color }}>{pld.name}:</span>
+                                <span className="text-slate-200 font-bold">{pld.value.toFixed(2)} {pld.unit || ''}</span>
+                              </div>
+                            ))}
+                          </div>
+                        );
+                      }
+                      return null;
+                    }}
+                  />
+                  <ReferenceLine x={selectedSpeed} stroke="#ef4444" strokeDasharray="3 3" />
+                  {activeChart === 'resistance' ? (
+                    <>
+                      <Line
+                        type="monotone"
+                        dataKey="rf"
+                        name="Frictional (Rf)"
+                        stroke="#64748b"
+                        strokeWidth={1.5}
+                        strokeDasharray="4 4"
+                        dot={false}
+                        unit=" kN"
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="rw"
+                        name="Wave (Rw)"
+                        stroke="#a855f7"
+                        strokeWidth={1.5}
+                        strokeDasharray="4 4"
+                        dot={false}
+                        unit=" kN"
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="rt"
+                        name="Total (Rt)"
+                        stroke="#3b82f6"
+                        strokeWidth={3}
+                        dot={false}
+                        unit=" kN"
+                      />
+                    </>
+                  ) : (
+                    <Line
+                      type="monotone"
+                      dataKey="pe"
+                      name="Propulsion Power"
+                      stroke="#f59e0b"
+                      strokeWidth={3}
+                      dot={false}
+                      unit=" kW"
                     />
-                    <text
-                      x={mapX(val)}
-                      y={height - padding + 15}
-                      fill="#64748b"
-                      fontSize="9"
-                      fontFamily="monospace"
-                      textAnchor="middle"
-                    >
-                      {val}
-                    </text>
-                  </g>
-                ))}
-
-                {activeChart === 'resistance' ? (
-                  // Resistance chart ticks
-                  [50, 100, 200, 400, 600, 800].map(val => {
-                    if (val > maxResistance) return null;
-                    return (
-                      <g key={`y-grid-${val}`}>
-                        <line
-                          x1={padding}
-                          y1={mapY(val, maxResistance)}
-                          x2={width - padding}
-                          y2={mapY(val, maxResistance)}
-                          stroke="#1C2029"
-                          strokeWidth="1"
-                        />
-                        <text
-                          x={padding - 8}
-                          y={mapY(val, maxResistance) + 3}
-                          fill="#64748b"
-                          fontSize="9"
-                          fontFamily="monospace"
-                          textAnchor="end"
-                        >
-                          {val}
-                        </text>
-                      </g>
-                    );
-                  })
-                ) : (
-                  // Power chart ticks
-                  [2000, 5000, 10000, 15000, 20000, 30000].map(val => {
-                    if (val > maxPower) return null;
-                    return (
-                      <g key={`y-grid-${val}`}>
-                        <line
-                          x1={padding}
-                          y1={mapY(val, maxPower)}
-                          x2={width - padding}
-                          y2={mapY(val, maxPower)}
-                          stroke="#1C2029"
-                          strokeWidth="1"
-                        />
-                        <text
-                          x={padding - 8}
-                          y={mapY(val, maxPower) + 3}
-                          fill="#64748b"
-                          fontSize="9"
-                          fontFamily="monospace"
-                          textAnchor="end"
-                        >
-                          {val}
-                        </text>
-                      </g>
-                    );
-                  })
-                )}
-
-                {/* Axes */}
-                <line x1={padding} y1={height - padding} x2={width - padding} y2={height - padding} stroke="#475569" strokeWidth="1.5" />
-                <line x1={padding} y1={padding} x2={padding} y2={height - padding} stroke="#475569" strokeWidth="1.5" />
-
-                {activeChart === 'resistance' ? (
-                  <>
-                    {/* Frictional Line (Faded Slate) */}
-                    <polyline points={rfPathStr} fill="none" stroke="#64748b" strokeWidth="1.5" strokeDasharray="3,3" />
-                    {/* Wave Line (Purple) */}
-                    <polyline points={rwPathStr} fill="none" stroke="#a855f7" strokeWidth="1.5" strokeDasharray="3,3" />
-                    {/* Total Resistance (Solid Blue) */}
-                    <polyline points={rtPathStr} fill="none" stroke="#3b82f6" strokeWidth="3" />
-                    
-                    {/* Design point highlight */}
-                    <circle cx={mapX(selectedSpeed)} cy={mapY(currentVal.rt, maxResistance)} r="5" fill="#f59e0b" />
-                    <line x1={mapX(selectedSpeed)} y1={padding} x2={mapX(selectedSpeed)} y2={height - padding} stroke="#f59e0b" strokeWidth="1" strokeDasharray="4,4" />
-                  </>
-                ) : (
-                  <>
-                    {/* Power Line (Solid Amber) */}
-                    <polyline points={pePathStr} fill="none" stroke="#f59e0b" strokeWidth="3" />
-                    
-                    {/* Design point highlight */}
-                    <circle cx={mapX(selectedSpeed)} cy={mapY(currentVal.pe, maxPower)} r="5" fill="#ef4444" />
-                    <line x1={mapX(selectedSpeed)} y1={padding} x2={mapX(selectedSpeed)} y2={height - padding} stroke="#ef4444" strokeWidth="1" strokeDasharray="4,4" />
-                  </>
-                )}
-              </svg>
+                  )}
+                </LineChart>
+              </ResponsiveContainer>
             </div>
 
             {/* Power Output details */}

@@ -4,18 +4,87 @@
  */
 
 import React, { useState } from 'react';
-import { Hydrostatics } from '../types';
-import { Anchor, BarChart2, ShieldCheck, Scale, Waves, Pin, GitCompare, Trash2 } from 'lucide-react';
+import { Hydrostatics, HullParameters } from '../types';
+import { Anchor, BarChart2, ShieldCheck, Scale, Waves, Pin, GitCompare, Trash2, FileDown } from 'lucide-react';
+import { exportStabilityPDF } from '../utils/reportGenerator';
 
 interface HydrostaticsPanelProps {
   hydrostatics: Hydrostatics;
+  parameters?: HullParameters;
+  onParameterChange?: (params: Partial<HullParameters>) => void;
 }
 
-export default function HydrostaticsPanel({ hydrostatics }: HydrostaticsPanelProps) {
+export default function HydrostaticsPanel({ hydrostatics, parameters, onParameterChange }: HydrostaticsPanelProps) {
   const [activeChartTab, setActiveChartTab] = useState<'gz' | 'buoyancy'>('gz');
   const [hoveredGZ, setHoveredGZ] = useState<{ angle: number; gz: number } | null>(null);
   const [hoveredStation, setHoveredStation] = useState<{ x: number; buoyancyForce: number; pressureKPa: number; index: number } | null>(null);
   const [pinnedHydrostatics, setPinnedHydrostatics] = useState<Hydrostatics | null>(null);
+
+  // Animation states for draft (cargo loading/unloading)
+  const [isAnimating, setIsAnimating] = useState(false);
+  const animationRef = React.useRef<number | null>(null);
+  const initialDraftRef = React.useRef<number | null>(null);
+
+  React.useEffect(() => {
+    if (!isAnimating || !parameters || !onParameterChange) {
+      if (animationRef.current !== null) {
+        clearInterval(animationRef.current);
+        animationRef.current = null;
+      }
+      return;
+    }
+
+    // Keep track of the starting draft before simulation
+    if (initialDraftRef.current === null) {
+      initialDraftRef.current = parameters.draft;
+    }
+
+    const period = 8000; // 8 seconds cycle
+    const start = Date.now();
+
+    animationRef.current = window.setInterval(() => {
+      const elapsed = Date.now() - start;
+      const angle = (elapsed / period) * 2 * Math.PI;
+
+      // Oscillate draft smoothly between 25% and 80% of depth
+      const minD = Math.max(0.4, parameters.depth * 0.25);
+      const maxD = Math.max(0.8, parameters.depth * 0.80);
+      const range = maxD - minD;
+
+      const factor = 0.5 + 0.5 * Math.sin(angle - Math.PI / 2); // starts at minimum
+      const nextDraft = minD + factor * range;
+
+      onParameterChange({ draft: Number(nextDraft.toFixed(3)) });
+    }, 60);
+
+    return () => {
+      if (animationRef.current !== null) {
+        clearInterval(animationRef.current);
+        animationRef.current = null;
+      }
+    };
+  }, [isAnimating, parameters?.depth, onParameterChange]);
+
+  const toggleAnimation = () => {
+    if (isAnimating) {
+      setIsAnimating(false);
+      if (initialDraftRef.current !== null && onParameterChange) {
+        onParameterChange({ draft: initialDraftRef.current });
+        initialDraftRef.current = null;
+      }
+    } else {
+      if (parameters) {
+        initialDraftRef.current = parameters.draft;
+      }
+      setIsAnimating(true);
+    }
+  };
+
+  // Cargo load calculation for HUD display
+  const minD = parameters ? Math.max(0.4, parameters.depth * 0.25) : 0;
+  const maxD = parameters ? Math.max(0.8, parameters.depth * 0.80) : 1;
+  const currentDraft = parameters ? parameters.draft : 1;
+  const loadPercentage = maxD !== minD ? Math.max(0, Math.min(100, ((currentDraft - minD) / (maxD - minD)) * 100)) : 0;
 
   // SVG Graph Sizing
   const width = 450;
@@ -156,11 +225,47 @@ export default function HydrostaticsPanel({ hydrostatics }: HydrostaticsPanelPro
       <div className="flex flex-col sm:flex-row sm:items-center justify-between border-b border-slate-700 pb-3 mb-4 gap-3">
         <div className="flex items-center space-x-2">
           <Anchor className="w-5 h-5 text-cyan-400 animate-pulse" />
-          <h2 className="font-semibold text-base text-slate-100 tracking-tight" id="hydrostatics_title">Hydrostatics & Stability Report</h2>
+          <div className="flex flex-col">
+            <h2 className="font-semibold text-base text-slate-100 tracking-tight" id="hydrostatics_title">Hydrostatics & Stability Report</h2>
+            {isAnimating && (
+              <span className="text-[10px] text-rose-400 font-mono flex items-center space-x-1 mt-0.5 animate-pulse">
+                <span className="w-1.5 h-1.5 rounded-full bg-rose-500"></span>
+                <span className="font-bold tracking-tight">CARGO SIMULATION ACTIVE: {loadPercentage.toFixed(0)}% CAPACITY UTILIZATION ({currentDraft.toFixed(2)}m)</span>
+              </span>
+            )}
+          </div>
         </div>
         
         {/* Pin & Compare Controls */}
-        <div className="flex items-center space-x-2 text-xs" id="hydrostatics_compare_controls">
+        <div className="flex flex-wrap items-center gap-2 text-xs" id="hydrostatics_compare_controls">
+          {parameters && (
+            <button
+              onClick={() => exportStabilityPDF(hydrostatics, parameters)}
+              className="flex items-center space-x-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white border border-emerald-500/20 px-3 py-1.5 rounded-md transition-all font-semibold font-mono text-xs shadow-[0_2px_8px_rgba(16,185,129,0.25)] hover:shadow-[0_4px_12px_rgba(16,185,129,0.4)] cursor-pointer"
+              title="Compile and download a printable 2-page PDF stability and hydrostatics summary report"
+              id="btn_generate_report"
+            >
+              <FileDown className="w-3.5 h-3.5" />
+              <span>Generate Report</span>
+            </button>
+          )}
+
+          {parameters && onParameterChange && (
+            <button
+              onClick={toggleAnimation}
+              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-md transition font-semibold font-mono text-xs border ${
+                isAnimating
+                  ? 'bg-rose-950/40 text-rose-400 border-rose-500/30 animate-pulse shadow-[0_0_10px_rgba(244,63,94,0.15)]'
+                  : 'bg-slate-950/60 hover:bg-slate-900 text-cyan-400 hover:text-cyan-300 border-slate-800'
+              }`}
+              title="Oscillate draft smoothly to simulate cargo loading/unloading cargo and inspect dynamic GZ curves"
+              id="btn_animate_draft"
+            >
+              <Waves className={`w-3.5 h-3.5 ${isAnimating ? 'animate-bounce' : ''}`} />
+              <span>{isAnimating ? 'Stop Cargo Sim' : 'Animate Draft (Cargo Sim)'}</span>
+            </button>
+          )}
+
           {pinnedHydrostatics ? (
             <>
               <div className="flex items-center space-x-1.5 bg-cyan-950/50 text-cyan-400 border border-cyan-800/40 px-2.5 py-1.5 rounded-md font-mono text-[10px]">
@@ -230,6 +335,145 @@ export default function HydrostaticsPanel({ hydrostatics }: HydrostaticsPanelPro
               </div>
             </div>
           </div>
+
+          {/* Visual Balance & CoG Calibration Card */}
+          {parameters && onParameterChange && (
+            <div className="bg-slate-950 p-3.5 rounded border border-cyan-500/20 space-y-3 shadow-[0_4px_12px_rgba(0,0,0,0.5)]">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-2">
+                  <Scale className="w-4 h-4 text-cyan-400" />
+                  <h3 className="text-xs font-bold text-slate-200 uppercase tracking-wider font-mono">
+                    Visual Balance &amp; CoG Calibration
+                  </h3>
+                </div>
+                {(parameters.cogLcg !== undefined || parameters.cogVcg !== undefined) && (
+                  <button
+                    onClick={() => {
+                      onParameterChange({
+                        cogLcg: undefined,
+                        cogVcg: undefined
+                      });
+                    }}
+                    className="text-[10px] text-slate-400 hover:text-cyan-400 font-mono transition flex items-center space-x-1 border border-slate-800 hover:border-cyan-500/30 px-2 py-0.5 rounded bg-slate-900 cursor-pointer"
+                    title="Reset to Hydrostatic default assumptions"
+                  >
+                    <span>Reset Assumed Defaults</span>
+                  </button>
+                )}
+              </div>
+
+              <div className="space-y-3.5 text-xs">
+                {/* LCG Slider */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[11px] font-mono">
+                    <span className="text-slate-400">Longitudinal Center of Gravity (LCG):</span>
+                    <span className="text-cyan-400 font-bold font-mono">
+                      {(parameters.cogLcg !== undefined ? parameters.cogLcg : parameters.length * 0.48).toFixed(2)} m
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max={parameters.length}
+                    step="0.05"
+                    value={parameters.cogLcg !== undefined ? parameters.cogLcg : parameters.length * 0.48}
+                    onChange={(e) => onParameterChange({ cogLcg: parseFloat(e.target.value) })}
+                    className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                  />
+                  <div className="flex justify-between text-[9px] text-slate-500 font-mono">
+                    <span>0m (Transom)</span>
+                    <span>Mid: {(parameters.length / 2).toFixed(1)}m</span>
+                    <span>{parameters.length.toFixed(1)}m (Bow)</span>
+                  </div>
+                </div>
+
+                {/* VCG Slider */}
+                <div className="space-y-1">
+                  <div className="flex justify-between text-[11px] font-mono">
+                    <span className="text-slate-400">Vertical Center of Gravity (VCG / KG):</span>
+                    <span className="text-cyan-400 font-bold font-mono">
+                      {(parameters.cogVcg !== undefined ? parameters.cogVcg : parameters.depth * 0.58).toFixed(2)} m
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max={parameters.depth}
+                    step="0.01"
+                    value={parameters.cogVcg !== undefined ? parameters.cogVcg : parameters.depth * 0.58}
+                    onChange={(e) => onParameterChange({ cogVcg: parseFloat(e.target.value) })}
+                    className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-500"
+                  />
+                  <div className="flex justify-between text-[9px] text-slate-500 font-mono">
+                    <span>0m (Keel)</span>
+                    <span>Draft: {parameters.draft.toFixed(1)}m</span>
+                    <span>{parameters.depth.toFixed(1)}m (Deck)</span>
+                  </div>
+                </div>
+
+                {/* Trim and Stability Indicators */}
+                <div className="bg-slate-900/60 p-2.5 rounded border border-slate-850 space-y-2">
+                  {(() => {
+                    const currentLcg = parameters.cogLcg !== undefined ? parameters.cogLcg : parameters.length * 0.48;
+                    const diff = hydrostatics.lcb - currentLcg;
+                    const absDiff = Math.abs(diff);
+
+                    let statusText = '';
+                    let colorClass = '';
+
+                    if (absDiff < 0.05) {
+                      statusText = "Perfect Trim: Longitudinal gravity matches buoyancy center exactly.";
+                      colorClass = "text-emerald-400";
+                    } else if (diff < 0) {
+                      statusText = `Bow Trim: Nose digs down by ${absDiff.toFixed(2)}m due to forward weighted gravity.`;
+                      colorClass = "text-amber-400";
+                    } else {
+                      statusText = `Stern Trim: Transom squatted by ${absDiff.toFixed(2)}m due to aft weighted gravity.`;
+                      colorClass = "text-cyan-400";
+                    }
+
+                    return (
+                      <div className="text-[11px] font-mono">
+                        <span className="text-slate-400 block text-[9px] uppercase tracking-wider mb-0.5">Trim Balance (LCB - LCG)</span>
+                        <div className="flex items-center justify-between">
+                          <span className={`font-semibold ${colorClass}`}>{statusText}</span>
+                          <span className="text-slate-500 text-[10px]">({(diff >= 0 ? '+' : '')}{diff.toFixed(2)}m)</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
+
+                  <div className="border-t border-slate-800 my-1.5" />
+
+                  {(() => {
+                    let statusText = '';
+                    let colorClass = '';
+
+                    if (hydrostatics.gmt > 1.0) {
+                      statusText = "Excellent Stability: High metacentric height prevents excessive roll.";
+                      colorClass = "text-emerald-400";
+                    } else if (hydrostatics.gmt >= 0.5) {
+                      statusText = "Safe Stability: Standard roll damping margin.";
+                      colorClass = "text-yellow-400";
+                    } else {
+                      statusText = "CRITICAL WARNING: GM_T under 0.50m! High risk of capsizing in beam seas.";
+                      colorClass = "text-rose-400 font-bold animate-pulse";
+                    }
+
+                    return (
+                      <div className="text-[11px] font-mono">
+                        <span className="text-slate-400 block text-[9px] uppercase tracking-wider mb-0.5">Transverse Roll Stability</span>
+                        <div className="flex items-center justify-between">
+                          <span className={`font-semibold ${colorClass}`}>{statusText}</span>
+                          <span className="text-slate-500 text-[10px]">GM: {hydrostatics.gmt.toFixed(2)}m</span>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Metacentric parameters */}
           <div className="bg-slate-950 p-3 rounded border border-slate-850 space-y-2">

@@ -11,12 +11,11 @@ import ParamsPanel from './components/ParamsPanel';
 import HydrostaticsPanel from './components/HydrostaticsPanel';
 import ResistancePanel from './components/ResistancePanel';
 import ScriptingPanel from './components/ScriptingPanel';
-import CollaborationPanel from './components/CollaborationPanel';
 import AnalyticsPanel from './components/AnalyticsPanel';
 import ApiPanel from './components/ApiPanel';
 import StructureTreePanel from './components/StructureTreePanel';
 import NumericalSolversPanel from './components/NumericalSolversPanel';
-import { Ship, Download, FileText, Share2, HelpCircle, HardDrive, ShieldAlert, Cpu } from 'lucide-react';
+import { Ship, Download, FileText, Share2, HelpCircle, HardDrive, ShieldAlert, Cpu, ChevronDown, ChevronUp } from 'lucide-react';
 
 // Pre-defined ship design files
 interface PresetShip {
@@ -159,8 +158,13 @@ export default function App() {
   }, [parameters, activePresetIdx]);
   
   // Tab control
-  const [activeTab, setActiveTab] = useState<'hydrostatics' | 'resistance' | 'scripting' | 'collaboration' | 'analytics' | 'api'>('hydrostatics');
+  const [activeTab, setActiveTab] = useState<'hydrostatics' | 'resistance' | 'scripting' | 'analytics' | 'api'>('hydrostatics');
   const [workbenchMode, setWorkbenchMode] = useState<'modeling' | 'structure' | 'solvers'>('modeling');
+
+  // Workspace layout space toggles to maximize the CAD viewports on demand
+  const [isLeftSidebarOpen, setIsLeftSidebarOpen] = useState(true);
+  const [isRightSidebarOpen, setIsRightSidebarOpen] = useState(true);
+  const [isBottomPanelOpen, setIsBottomPanelOpen] = useState(true);
   
   // Collaboration & Role configurations
   const [userRole, setUserRole] = useState<'Admin' | 'Designer' | 'Viewer'>('Designer');
@@ -333,14 +337,42 @@ export default function App() {
               Numerical Solvers
             </button>
           </div>
+
+          {/* Real-Time Layout Space Maximizer (Visual Deck Toggles) */}
+          {workbenchMode === 'modeling' && (
+            <div className="hidden lg:flex items-center space-x-1 bg-slate-950 p-1 rounded-md border border-slate-800 ml-4 shadow-inner" id="layout_space_maximizer">
+              <span className="text-[9px] text-slate-500 font-bold uppercase tracking-wider font-mono px-1.5">Workspace:</span>
+              <button
+                onClick={() => setIsLeftSidebarOpen(!isLeftSidebarOpen)}
+                className={`px-2 py-0.5 text-[9px] font-bold font-mono rounded transition cursor-pointer ${isLeftSidebarOpen ? 'bg-cyan-500/15 text-cyan-400 font-semibold' : 'text-slate-500 hover:text-slate-300'}`}
+                title="Toggle Left Blueprints Sidebar"
+              >
+                Blueprints
+              </button>
+              <button
+                onClick={() => setIsBottomPanelOpen(!isBottomPanelOpen)}
+                className={`px-2 py-0.5 text-[9px] font-bold font-mono rounded transition cursor-pointer ${isBottomPanelOpen ? 'bg-cyan-500/15 text-cyan-400 font-semibold' : 'text-slate-500 hover:text-slate-300'}`}
+                title="Toggle Bottom Analytics Deck"
+              >
+                Analytics
+              </button>
+              <button
+                onClick={() => setIsRightSidebarOpen(!isRightSidebarOpen)}
+                className={`px-2 py-0.5 text-[9px] font-bold font-mono rounded transition cursor-pointer ${isRightSidebarOpen ? 'bg-cyan-500/15 text-cyan-400 font-semibold' : 'text-slate-500 hover:text-slate-300'}`}
+                title="Toggle Right Parametric Parameters Sidebar"
+              >
+                Parameters
+              </button>
+            </div>
+          )}
         </div>
 
         {/* CAD Exports & Actions bar */}
         <div className="flex items-center space-x-4" id="cad_actions_bar">
-          {/* Real-time Cloud Sync state indicator from Geometric Balance design */}
-          <div className="flex items-center space-x-2 px-3 py-1 bg-emerald-950/20 border border-emerald-900/40 rounded-full">
-            <div className="w-2 h-2 bg-emerald-500 rounded-full animate-pulse"></div>
-            <span className="text-[9px] text-emerald-400 font-mono uppercase tracking-wider font-semibold">Cloud Synced</span>
+          {/* Local CAD Sandbox state indicator */}
+          <div className="flex items-center space-x-2 px-3 py-1 bg-cyan-950/20 border border-cyan-900/40 rounded-full">
+            <div className="w-2 h-2 bg-cyan-400 rounded-full"></div>
+            <span className="text-[9px] text-cyan-400 font-mono uppercase tracking-wider font-semibold">Local CAD Engine</span>
           </div>
 
           {/* Local Storage Auto-saved status indicator */}
@@ -395,56 +427,58 @@ export default function App() {
         {workbenchMode === 'structure' ? (
           <StructureTreePanel parameters={parameters} onParameterChange={handleParameterChange} />
         ) : workbenchMode === 'solvers' ? (
-          <NumericalSolversPanel parameters={parameters} />
+          <NumericalSolversPanel parameters={parameters} onParameterChange={handleParameterChange} />
         ) : (
           <>
             {/* Left Sidebar: CAD Models List */}
-            <aside className="w-64 bg-slate-900/60 border-r border-slate-800 flex flex-col justify-between shrink-0 hidden lg:flex" id="left_preset_sidebar">
-              <div className="p-4 space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center space-x-1.5">
-                    <HardDrive className="w-3.5 h-3.5 text-cyan-400" />
-                    <span>Hull Blueprints</span>
-                  </h2>
-                  <span className="text-[10px] font-mono text-slate-500">ROOT/.</span>
+            {isLeftSidebarOpen && (
+              <aside className="w-64 bg-slate-900/60 border-r border-slate-800 flex flex-col justify-between shrink-0 hidden lg:flex" id="left_preset_sidebar">
+                <div className="p-4 space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h2 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center space-x-1.5">
+                      <HardDrive className="w-3.5 h-3.5 text-cyan-400" />
+                      <span>Hull Blueprints</span>
+                    </h2>
+                    <span className="text-[10px] font-mono text-slate-500">ROOT/.</span>
+                  </div>
+
+                  <div className="space-y-1.5" id="presets_list">
+                    {PRESET_VESSELS.map((vessel, i) => (
+                      <button
+                        key={vessel.fileName}
+                        onClick={() => handleLoadVessel(i)}
+                        className={`w-full text-left p-3 rounded-lg border transition flex items-start space-x-2.5 ${activePresetIdx === i ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
+                      >
+                        <Ship className="w-4 h-4 shrink-0 mt-0.5 text-cyan-400" />
+                        <div className="overflow-hidden">
+                          <span className="font-semibold text-xs block truncate">{vessel.name}</span>
+                          <span className="text-[9px] font-mono text-slate-500 block">{vessel.fileName}</span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
-                <div className="space-y-1.5" id="presets_list">
-                  {PRESET_VESSELS.map((vessel, i) => (
-                    <button
-                      key={vessel.fileName}
-                      onClick={() => handleLoadVessel(i)}
-                      className={`w-full text-left p-3 rounded-lg border transition flex items-start space-x-2.5 ${activePresetIdx === i ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
-                    >
-                      <Ship className="w-4 h-4 shrink-0 mt-0.5 text-cyan-400" />
-                      <div className="overflow-hidden">
-                        <span className="font-semibold text-xs block truncate">{vessel.name}</span>
-                        <span className="text-[9px] font-mono text-slate-500 block">{vessel.fileName}</span>
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Quick Stats card */}
-              <div className="p-4 bg-slate-950/50 border-t border-slate-850/50 space-y-3 font-mono text-[11px]">
-                <span className="text-slate-400 uppercase tracking-wider block text-[10px] font-bold">Project Status</span>
-                <div className="space-y-1.5 text-slate-300">
-                  <div className="flex justify-between">
-                    <span>Total Displacement:</span>
-                    <span className="text-emerald-400 font-bold">{hydrostatics.displacementMass.toFixed(0)} t</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Resistance Class:</span>
-                    <span className="text-cyan-400">{resistance.designPowerKw < 5000 ? 'Low Drag' : 'Standard'}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span>Active Model:</span>
-                    <span className="text-slate-100">{PRESET_VESSELS[activePresetIdx].fileName}</span>
+                {/* Quick Stats card */}
+                <div className="p-4 bg-slate-950/50 border-t border-slate-850/50 space-y-3 font-mono text-[11px]">
+                  <span className="text-slate-400 uppercase tracking-wider block text-[10px] font-bold">Project Status</span>
+                  <div className="space-y-1.5 text-slate-300">
+                    <div className="flex justify-between">
+                      <span>Total Displacement:</span>
+                      <span className="text-emerald-400 font-bold">{hydrostatics.displacementMass.toFixed(0)} t</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Resistance Class:</span>
+                      <span className="text-cyan-400">{resistance.designPowerKw < 5000 ? 'Low Drag' : 'Standard'}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span>Active Model:</span>
+                      <span className="text-slate-100">{PRESET_VESSELS[activePresetIdx].fileName}</span>
+                    </div>
                   </div>
                 </div>
-              </div>
-            </aside>
+              </aside>
+            )}
 
             {/* Center Workspace (Viewports on Top, Tabs on Bottom) */}
             <div className="flex-1 flex flex-col overflow-hidden min-w-0">
@@ -487,75 +521,96 @@ export default function App() {
                 <ViewportsContainer
                   parameters={parameters}
                   onParameterChange={handleParameterChange}
-                  collaborators={[
-                    { name: 'Sarah Jenkins', color: '#38bdf8', activePanel: '3d' },
-                    { name: 'David Mercer', color: '#818cf8', activePanel: 'profile' }
-                  ]}
+                  collaborators={[]}
+                  hydrostatics={hydrostatics}
                 />
               </div>
 
               {/* Bottom Panel: Interactive Analytics & Tool Tabs */}
-              <div className="h-2/5 bg-slate-900 border-t border-slate-800 flex flex-col overflow-hidden shrink-0 min-h-[300px]">
+              <div className={`${isBottomPanelOpen ? 'h-2/5 min-h-[300px]' : 'h-11 shrink-0'} bg-slate-900 border-t border-slate-800 flex flex-col overflow-hidden shrink-0 transition-all duration-200`} id="bottom_deck_panel">
                 {/* Bottom Nav bar */}
-                <div className="flex items-center justify-between px-6 bg-slate-850 border-b border-slate-800 shrink-0 overflow-x-auto">
+                <div className="flex items-center justify-between px-6 bg-slate-850 border-b border-slate-800 shrink-0 overflow-x-auto h-11">
                   <div className="flex space-x-1 py-1" id="analysis_deck_tabs">
                     {[
                       { id: 'hydrostatics', label: 'Hydrostatics & Stability' },
                       { id: 'resistance', label: 'Drag & Power Analysis' },
                       { id: 'scripting', label: 'Python Scripting IDE' },
-                      { id: 'collaboration', label: 'Collaboration & Sync' },
                       { id: 'analytics', label: 'Productivity KPI' },
                       { id: 'api', label: 'API & Webhooks' }
                     ].map(tab => (
                       <button
                         key={tab.id}
-                        onClick={() => setActiveTab(tab.id as any)}
-                        className={`px-4 py-2.5 text-xs font-semibold rounded-t transition border-b-2 ${activeTab === tab.id ? 'text-cyan-400 border-cyan-400 bg-slate-900' : 'text-slate-400 hover:text-slate-200 border-transparent hover:bg-slate-900/50'}`}
+                        onClick={() => {
+                          setActiveTab(tab.id as any);
+                          setIsBottomPanelOpen(true);
+                        }}
+                        className={`px-4 py-2 text-xs font-semibold rounded-t transition border-b-2 ${activeTab === tab.id && isBottomPanelOpen ? 'text-cyan-400 border-cyan-400 bg-slate-900' : 'text-slate-400 hover:text-slate-200 border-transparent hover:bg-slate-900/50'}`}
                       >
                         {tab.label}
                       </button>
                     ))}
                   </div>
 
-                  {/* Warnings regarding read-only state */}
-                  {userRole === 'Viewer' && (
-                    <div className="flex items-center space-x-1 text-[10px] text-amber-400 font-mono bg-amber-500/10 px-2 py-1 rounded border border-amber-500/15">
-                      <ShieldAlert className="w-3.5 h-3.5" />
-                      <span>VIEWER MODE (Read-Only)</span>
-                    </div>
-                  )}
+                  {/* Warnings regarding read-only state and expand/collapse control */}
+                  <div className="flex items-center space-x-3">
+                    {userRole === 'Viewer' && (
+                      <div className="flex items-center space-x-1 text-[10px] text-amber-400 font-mono bg-amber-500/10 px-2 py-1 rounded border border-amber-500/15">
+                        <ShieldAlert className="w-3.5 h-3.5" />
+                        <span>VIEWER MODE (Read-Only)</span>
+                      </div>
+                    )}
+
+                    {/* Minimize / Expand Button */}
+                    <button
+                      onClick={() => setIsBottomPanelOpen(!isBottomPanelOpen)}
+                      className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded transition flex items-center space-x-1"
+                      title={isBottomPanelOpen ? "Collapse Analytics Deck" : "Expand Analytics Deck"}
+                    >
+                      {isBottomPanelOpen ? (
+                        <>
+                          <ChevronDown className="w-4 h-4 text-cyan-400" />
+                          <span className="text-[10px] font-mono text-slate-500 hidden sm:inline">Collapse</span>
+                        </>
+                      ) : (
+                        <>
+                          <ChevronUp className="w-4 h-4 text-cyan-400 animate-pulse" />
+                          <span className="text-[10px] font-mono text-cyan-400 hidden sm:inline">Expand Deck</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 {/* Bottom Panel Content Drawer */}
-                <div className="flex-1 overflow-hidden p-1">
-                  {activeTab === 'hydrostatics' && <HydrostaticsPanel hydrostatics={hydrostatics} />}
-                  {activeTab === 'resistance' && <ResistancePanel analysis={resistance} />}
-                  {activeTab === 'scripting' && <ScriptingPanel parameters={parameters} onScriptExecute={handleScriptExecute} />}
-                  {activeTab === 'collaboration' && (
-                    <CollaborationPanel
-                      parameters={parameters}
-                      onRestoreCommit={handleRestoreCommit}
-                      activeRole={userRole}
-                      onRoleChange={setUserRole}
-                      commits={commits}
-                      onAddCommit={handleAddCommit}
-                    />
-                  )}
-                  {activeTab === 'analytics' && <AnalyticsPanel metrics={metrics} stabilityScore={hydrostatics.gmt * 10} dragReductionScore={15 - resistance.designResistanceKn / 100} />}
-                  {activeTab === 'api' && <ApiPanel parameters={parameters} hydrostatics={hydrostatics} />}
-                </div>
+                {isBottomPanelOpen && (
+                  <div className="flex-1 overflow-hidden p-1">
+                    {activeTab === 'hydrostatics' && (
+                      <HydrostaticsPanel
+                        hydrostatics={hydrostatics}
+                        parameters={parameters}
+                        onParameterChange={handleParameterChange}
+                      />
+                    )}
+                    {activeTab === 'resistance' && <ResistancePanel analysis={resistance} parameters={parameters} />}
+                    {activeTab === 'scripting' && <ScriptingPanel parameters={parameters} onScriptExecute={handleScriptExecute} />}
+                    {activeTab === 'analytics' && <AnalyticsPanel metrics={metrics} stabilityScore={hydrostatics.gmt * 10} dragReductionScore={15 - resistance.designResistanceKn / 100} />}
+                    {activeTab === 'api' && <ApiPanel parameters={parameters} hydrostatics={hydrostatics} />}
+                  </div>
+                )}
               </div>
             </div>
 
             {/* Right Sidebar: Persistent Sliders (Standard CAD layout) */}
-            <aside className="w-80 bg-slate-900/60 border-l border-slate-800 shrink-0 hidden xl:block" id="right_parametric_sidebar">
-              <ParamsPanel
-                parameters={parameters}
-                onParameterChange={handleParameterChange}
-                onReset={handleReset}
-                activeRole={userRole}
-              />
-            </aside>
+            {isRightSidebarOpen && (
+              <aside className="w-80 bg-slate-900/60 border-l border-slate-800 shrink-0 hidden xl:block animate-fade-in" id="right_parametric_sidebar">
+                <ParamsPanel
+                  parameters={parameters}
+                  onParameterChange={handleParameterChange}
+                  onReset={handleReset}
+                  activeRole={userRole}
+                />
+              </aside>
+            )}
           </>
         )}
       </div>

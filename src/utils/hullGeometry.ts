@@ -317,8 +317,8 @@ export function calculateHydrostatics(params: HullParameters): Hydrostatics {
   const kbt = vcb;
   const kmt = kbt + bmt;
 
-  // Assume Vertical Center of Gravity KG is at 60% of hull depth
-  const kg = params.depth * 0.58;
+  // Assume Vertical Center of Gravity KG is at 60% of hull depth, unless overridden by custom balance inputs
+  const kg = params.cogVcg !== undefined ? params.cogVcg : params.depth * 0.58;
   const gmt = Math.max(0.1, kmt - kg);
 
   // Hull Coefficients
@@ -399,15 +399,43 @@ export function calculateResistance(params: HullParameters, hydro: Hydrostatics)
     const cf = 0.075 / Math.pow(Math.log10(rn) - 2, 2);
     const rf = 0.5 * density * 1000 * cf * hydro.wettedSurfaceArea * v * v / 1000; // in kN
 
-    // Wave-making resistance (highly simplified Holtrop-Mennen model)
-    // Wave resistance peaks around hull speed (Fn ~ 0.4) and grows exponentially
-    let cw = 0.003 * Math.pow(hydro.cb, 1.5);
-    if (fn < 0.4) {
-      cw = cw * Math.pow(fn / 0.4, 4);
-    } else {
-      cw = cw * (1 + 1.5 * (fn - 0.4));
+    // Wave-making resistance using the Holtrop-Mennen method formulation
+    // Reference: Holtrop and Mennen (1982, 1984)
+    // rw = c1 * c2 * c5 * displacementVolume * density * g * exp(m1 * Fn^d + m2 * cos(lambda * Fn^-2))
+    const L = params.length;
+    const B = params.beam;
+    const T = params.draft;
+    const Cb = hydro.cb;
+    const Cp = Math.min(0.95, Math.max(0.4, Cb / 0.98)); // approximate prismatic coefficient
+    
+    // c1 coefficient based on L/B ratio and Cp
+    let c1 = 22.2394 * Math.pow(B/L, 3.78613) * Math.pow(T/B, 1.07961) * Math.pow(0.90 - Cp, -1.37565);
+    if (isNaN(c1) || c1 <= 0 || !isFinite(c1)) c1 = 0.015; // robust fallback guard
+    
+    const c2 = 1.0; // neutral bulbous bow coefficient
+    const c5 = 1.0; // neutral transom area ratio coefficient
+    const d = -0.9;
+    
+    const m1 = 0.011072 * Math.pow(L/B, 0.5) * Math.pow(T/L, 0.2);
+    const m2 = -0.003 * Math.pow(L/B, 1.5) * Math.pow(Cp, 2) * Math.pow(T/B, 0.5);
+    const lambda = 1.4 * (1 - Cb);
+    
+    let rw = 0;
+    if (fn > 0.05) {
+      const expTerm = m1 * Math.pow(fn, d) + m2 * Math.cos(lambda / (fn * fn));
+      rw = c1 * c2 * c5 * hydro.displacementVolume * density * g * Math.exp(expTerm) * 1.5; // scaled to kN/tonne
     }
-    const rw = 0.5 * density * 1000 * cw * Math.pow(hydro.displacementVolume, 2/3) * v * v / 1000; // kN
+    
+    // Limit exponential growth at high Froude numbers to prevent unrealistically large values
+    if (fn > 0.45) {
+      const rwAtLimit = c1 * c2 * c5 * hydro.displacementVolume * density * g * Math.exp(m1 * Math.pow(0.45, d) + m2 * Math.cos(lambda / (0.45 * 0.45))) * 1.5;
+      rw = rwAtLimit * (1 + 1.2 * (fn - 0.45));
+    }
+    
+    if (isNaN(rw) || rw < 0 || !isFinite(rw)) {
+      // standard fallback wave resistance approximation if Holtrop outputs non-numerical values
+      rw = 0.5 * density * 1000 * 0.003 * Math.pow(Cb, 1.5) * Math.pow(hydro.displacementVolume, 2/3) * v * v / 1000;
+    }
 
     // Total Resistance (kN) with small append/correlation allowance
     const ca = 0.0004; // correlation allowance

@@ -22,6 +22,7 @@ import { calculateHydrostatics, calculateResistance } from '../utils/hullGeometr
 
 interface NumericalSolversPanelProps {
   parameters: HullParameters;
+  onParameterChange?: (params: Partial<HullParameters>) => void;
 }
 
 interface SolverLog {
@@ -29,6 +30,15 @@ interface SolverLog {
   step: number;
   text: string;
   type: 'info' | 'progress' | 'success' | 'warning';
+}
+
+interface OptimizationTrial {
+  iteration: number;
+  fullness: number;
+  flare: number;
+  displacement: number;
+  resistance: number;
+  status: 'valid' | 'invalid_displacement';
 }
 
 // Sensitivity parameters metadata
@@ -77,7 +87,7 @@ function getModifiedParams(params: HullParameters, key: string, percentChange: n
   return copy;
 }
 
-export default function NumericalSolversPanel({ parameters }: NumericalSolversPanelProps) {
+export default function NumericalSolversPanel({ parameters, onParameterChange }: NumericalSolversPanelProps) {
   // Solver Settings
   const [selectedSolver, setSelectedSolver] = useState<'cfd' | 'fea' | 'hydro'>('cfd');
   const [meshDensity, setMeshDensity] = useState<'coarse' | 'medium' | 'fine' | 'ultra'>('medium');
@@ -92,10 +102,20 @@ export default function NumericalSolversPanel({ parameters }: NumericalSolversPa
   const [hasFinished, setHasFinished] = useState<boolean>(false);
 
   // Sensitivity State Variables
-  const [activeSubView, setActiveSubView] = useState<'solver' | 'sensitivity'>('solver');
+  const [activeSubView, setActiveSubView] = useState<'solver' | 'sensitivity' | 'optimizer'>('solver');
   const [selectedSensitivityParam, setSelectedSensitivityParam] = useState<string>('beam');
   const [sensitivityRange, setSensitivityRange] = useState<number>(20); // ±20%
   const [hoveredPointIdx, setHoveredPointIdx] = useState<number | null>(null);
+
+  // Optimizer State
+  const [isOptimizing, setIsOptimizing] = useState<boolean>(false);
+  const [optSpeed, setOptSpeed] = useState<number>(15);
+  const [optDispTol, setOptDispTol] = useState<number>(5); // percentage, e.g. ±5%
+  const [optMaxIters, setOptMaxIters] = useState<number>(20);
+  const [optCurrentIter, setOptCurrentIter] = useState<number>(0);
+  const [optTrials, setOptTrials] = useState<OptimizationTrial[]>([]);
+  const [optBestTrial, setOptBestTrial] = useState<OptimizationTrial | null>(null);
+  const [optBaseline, setOptBaseline] = useState<{ fullness: number; flare: number; displacement: number; resistance: number } | null>(null);
 
   // Ref to scroll terminal to bottom
   const terminalBottomRef = useRef<HTMLDivElement>(null);
@@ -237,6 +257,184 @@ export default function NumericalSolversPanel({ parameters }: NumericalSolversPa
     setResiduals([]);
     setLogs([]);
     setHasFinished(false);
+  };
+
+  // Trigger parametric optimizer execution
+  useEffect(() => {
+    let timer: NodeJS.Timeout;
+    if (isOptimizing && optCurrentIter < optMaxIters) {
+      timer = setTimeout(() => {
+        const nextIter = optCurrentIter + 1;
+        const baseDisp = optBaseline?.displacement ?? 100;
+        
+        // Let's perform a step of our 2D Optimization Search
+        let f = parameters.fullness;
+        let fl = parameters.flare;
+        
+        if (nextIter === 1) {
+          f = parameters.fullness;
+          fl = parameters.flare;
+        } else {
+          // Spiraling/hill-climbing contraction search
+          const bestSoFar = optBestTrial ?? { fullness: parameters.fullness, flare: parameters.flare };
+          const temp = 1.0 - (nextIter / optMaxIters) * 0.8; // Contract the search radius as we iterate
+          
+          const angle = (nextIter * 137.5 * Math.PI) / 180; // Golden ratio spiral sweep
+          const radiusF = 0.4 * temp;
+          const radiusFl = 15 * temp;
+          
+          f = Math.max(0.5, Math.min(2.0, bestSoFar.fullness + Math.cos(angle) * radiusF));
+          fl = Math.max(-15, Math.min(55, bestSoFar.flare + Math.sin(angle) * radiusFl));
+        }
+
+        // Evaluate candidate design
+        const candidateParams = { ...parameters, fullness: f, flare: fl };
+        let displacement = 0;
+        let resistance = 0;
+        let status: 'valid' | 'invalid_displacement' = 'valid';
+
+        try {
+          const hydro = calculateHydrostatics(candidateParams);
+          const res = calculateResistance(candidateParams, hydro);
+          displacement = hydro.displacementMass;
+          resistance = res.curves.find(c => c.speedKnots === optSpeed)?.rt ?? res.designResistanceKn;
+          
+          const dispDiffPct = ((displacement - baseDisp) / baseDisp) * 100;
+          if (Math.abs(dispDiffPct) > optDispTol) {
+            status = 'invalid_displacement';
+          }
+        } catch (e) {
+          status = 'invalid_displacement';
+        }
+
+        const trial: OptimizationTrial = {
+          iteration: nextIter,
+          fullness: f,
+          flare: fl,
+          displacement,
+          resistance,
+          status
+        };
+
+        setOptTrials(prev => [...prev, trial]);
+
+        // Update best valid trial
+        if (status === 'valid') {
+          if (!optBestTrial || trial.resistance < optBestTrial.resistance) {
+            setOptBestTrial(trial);
+          }
+        }
+
+        const statusText = status === 'valid' 
+          ? `🟢 [VALID] Disp: ${displacement.toFixed(1)}t (${((displacement - baseDisp)/baseDisp*100).toFixed(1)}%) | Drag: ${resistance.toFixed(2)}kN`
+          : `🔴 [FAIL] Disp constraint violated: ${displacement.toFixed(1)}t (${((displacement - baseDisp)/baseDisp*100).toFixed(1)}%)`;
+
+        const logText = `[OPTIMIZER] Loop ${nextIter}/${optMaxIters} | Cwp: ${f.toFixed(3)} | Flare: ${fl.toFixed(1)}° | ${statusText}`;
+        
+        setLogs(prev => [
+          ...prev,
+          {
+            id: `opt_iter_${nextIter}_${Date.now()}`,
+            step: nextIter,
+            text: logText,
+            type: status === 'valid' ? 'progress' : 'warning'
+          }
+        ]);
+
+        setOptCurrentIter(nextIter);
+
+        if (nextIter === optMaxIters) {
+          setIsOptimizing(false);
+          setLogs(prev => [
+            ...prev,
+            {
+              id: `opt_finish_${Date.now()}`,
+              step: nextIter,
+              text: `✨ PARAMETRIC OPTIMIZATION COMPLETE. Evaluated ${optMaxIters} designs.`,
+              type: 'success'
+            }
+          ]);
+        }
+      }, 150);
+    }
+    return () => clearTimeout(timer);
+  }, [isOptimizing, optCurrentIter, optMaxIters, optSpeed, optDispTol, optBaseline, optBestTrial, parameters]);
+
+  const handleStartOptimizer = () => {
+    if (isOptimizing) {
+      setIsOptimizing(false);
+      setLogs(prev => [
+        ...prev,
+        {
+          id: `opt_pause_${Date.now()}`,
+          step: optCurrentIter,
+          text: `⏸️ OPTIMIZATION PAUSED BY USER.`,
+          type: 'info'
+        }
+      ]);
+    } else {
+      const baselineHydro = calculateHydrostatics(parameters);
+      const baselineRes = calculateResistance(parameters, baselineHydro);
+      const baseDisp = baselineHydro.displacementMass;
+      const baseRes = baselineRes.curves.find(c => c.speedKnots === optSpeed)?.rt ?? baselineRes.designResistanceKn;
+
+      setOptBaseline({
+        fullness: parameters.fullness,
+        flare: parameters.flare,
+        displacement: baseDisp,
+        resistance: baseRes
+      });
+
+      setOptTrials([]);
+      setOptBestTrial(null);
+      setOptCurrentIter(0);
+      setIsOptimizing(true);
+
+      setLogs([
+        {
+          id: `opt_init_${Date.now()}`,
+          step: 0,
+          text: `🚀 [OPTIMIZER] Initializing Parametric Optimization Process...`,
+          type: 'info'
+        },
+        {
+          id: `opt_init_base_${Date.now()}`,
+          step: 0,
+          text: `[OPTIMIZER] Baseline Design: Cwp = ${parameters.fullness.toFixed(3)} | Flare = ${parameters.flare.toFixed(1)}° | Displacement = ${baseDisp.toFixed(1)}t | Drag at ${optSpeed}kn = ${baseRes.toFixed(2)}kN`,
+          type: 'info'
+        },
+        {
+          id: `opt_init_const_${Date.now()}`,
+          step: 0,
+          text: `[OPTIMIZER] Constraints: Displacement must be within ±${optDispTol}% (${(baseDisp * (1 - optDispTol/100)).toFixed(1)}t to ${(baseDisp * (1 + optDispTol/100)).toFixed(1)}t)`,
+          type: 'info'
+        },
+        {
+          id: `opt_init_run_${Date.now()}`,
+          step: 0,
+          text: `[OPTIMIZER] Commencing multi-dimensional parametric sweep (${optMaxIters} iterations)...`,
+          type: 'info'
+        }
+      ]);
+    }
+  };
+
+  const handleApplyOptimization = () => {
+    if (optBestTrial && onParameterChange) {
+      onParameterChange({
+        fullness: optBestTrial.fullness,
+        flare: optBestTrial.flare
+      });
+      setLogs(prev => [
+        ...prev,
+        {
+          id: `opt_applied_${Date.now()}`,
+          step: optCurrentIter,
+          text: `✔️ Applied optimized design parameters to active ship blueprint (Cwp = ${optBestTrial.fullness.toFixed(3)}, Side Flare = ${optBestTrial.flare.toFixed(1)}°)!`,
+          type: 'success'
+        }
+      ]);
+    }
   };
 
   // Generate Mesh overlay cells for 2D visual representation based on MeshDensity
@@ -393,118 +591,208 @@ export default function NumericalSolversPanel({ parameters }: NumericalSolversPa
           <span className="text-[10px] font-mono bg-emerald-950/20 text-emerald-400 border border-emerald-900/50 px-2 py-0.5 rounded">CPU RUNTIME</span>
         </div>
 
-        {/* Solver select menu */}
-        <div className="p-4 space-y-4" id="solver_select_and_settings">
-          <div className="space-y-1.5">
-            <label className="text-[10px] text-slate-400 uppercase font-bold tracking-wider block">Numerical Engine</label>
-            <div className="grid grid-cols-1 gap-1.5">
-              <button
-                onClick={() => { handleResetSolver(); setSelectedSolver('cfd'); }}
-                className={`w-full text-left p-3 rounded-lg border transition font-sans ${selectedSolver === 'cfd' ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
-              >
-                <div className="font-bold text-xs">Symmetric RANS CFD</div>
-                <div className="text-[9px] text-slate-500 mt-0.5 font-mono">Wave-making hull drag solver</div>
-              </button>
-
-              <button
-                onClick={() => { handleResetSolver(); setSelectedSolver('fea'); }}
-                className={`w-full text-left p-3 rounded-lg border transition font-sans ${selectedSolver === 'fea' ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
-              >
-                <div className="font-bold text-xs">Nonlinear Shell FEA</div>
-                <div className="text-[9px] text-slate-500 mt-0.5 font-mono">Structural strain & stress solver</div>
-              </button>
-
-              <button
-                onClick={() => { handleResetSolver(); setSelectedSolver('hydro'); }}
-                className={`w-full text-left p-3 rounded-lg border transition font-sans ${selectedSolver === 'hydro' ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
-              >
-                <div className="font-bold text-xs">BEM Hydrostatics</div>
-                <div className="text-[9px] text-slate-500 mt-0.5 font-mono">Surface boundary stability solver</div>
-              </button>
-            </div>
-          </div>
-
-          <div className="border-t border-slate-800/60 my-2"></div>
-
-          {/* Configuration inputs */}
-          <div className="space-y-3 font-mono text-xs">
-            <h4 className="text-[10px] text-slate-400 uppercase font-bold tracking-wider flex items-center space-x-1">
-              <Sliders className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Mesh & Convergence</span>
-            </h4>
-
-            {/* Mesh density selector */}
-            <div className="space-y-1 bg-slate-950 p-2.5 rounded-lg border border-slate-850">
-              <label className="text-[10px] text-slate-500 uppercase block font-bold">Mesh Element Density</label>
-              <select
-                value={meshDensity}
-                onChange={(e) => { handleResetSolver(); setMeshDensity(e.target.value as any); }}
-                className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-cyan-400 outline-none"
-              >
-                <option value="coarse">Coarse Grid (Fast & Rough)</option>
-                <option value="medium">Medium Grid (Standard CAD)</option>
-                <option value="fine">Fine Grid (Production Accurate)</option>
-                <option value="ultra">Ultra-Fine Grid (Research Grade)</option>
-              </select>
-            </div>
-
-            {/* Target Tolerance */}
-            <div className="space-y-1 bg-slate-950 p-2.5 rounded-lg border border-slate-850">
-              <label className="text-[10px] text-slate-500 uppercase block font-bold">Convergence limit</label>
-              <select
-                value={tolerance}
-                onChange={(e) => { handleResetSolver(); setTolerance(Number(e.target.value)); }}
-                className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-cyan-400 outline-none"
-              >
-                <option value={0.01}>1.0e-2 (Fast convergence)</option>
-                <option value={0.001}>1.0e-3 (Draft precision)</option>
-                <option value={0.0001}>1.0e-4 (Standard CAD rule)</option>
-                <option value={0.00001}>1.0e-5 (High precision)</option>
-              </select>
-            </div>
-
-            {/* Max Iterations */}
-            <div className="space-y-1 bg-slate-950 p-2.5 rounded-lg border border-slate-850">
-              <div className="flex justify-between">
-                <span className="text-[10px] text-slate-500 font-bold uppercase">Max Loops</span>
-                <span className="text-cyan-400 font-bold">{maxIterations}</span>
+        {/* Sidebar content based on activeSubView */}
+        {activeSubView === 'optimizer' ? (
+          <div className="p-4 space-y-4" id="optimizer_config_settings">
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-slate-400 uppercase font-bold tracking-wider block">Target Cruise Speed</label>
+              <div className="bg-slate-950 p-3 rounded-lg border border-slate-850 space-y-2">
+                <div className="flex justify-between text-xs font-mono font-bold text-cyan-400">
+                  <span>Speed:</span>
+                  <span>{optSpeed} Knots</span>
+                </div>
+                <input
+                  type="range"
+                  min="1"
+                  max="30"
+                  step="1"
+                  value={optSpeed}
+                  onChange={(e) => setOptSpeed(Number(e.target.value))}
+                  className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
+                />
               </div>
-              <input
-                type="range"
-                min="50"
-                max="300"
-                step="25"
-                value={maxIterations}
-                onChange={(e) => { handleResetSolver(); setMaxIterations(Number(e.target.value)); }}
-                className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
-              />
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-slate-400 uppercase font-bold tracking-wider block">Displacement Tolerance</label>
+              <div className="grid grid-cols-3 gap-1 bg-slate-950 p-1 rounded-lg border border-slate-850">
+                {[2, 5, 10].map(tol => (
+                  <button
+                    key={tol}
+                    type="button"
+                    onClick={() => setOptDispTol(tol)}
+                    className={`py-1 text-[10px] font-mono font-bold rounded transition ${optDispTol === tol ? 'bg-cyan-500 text-slate-950 font-extrabold' : 'text-slate-400 hover:text-slate-200'}`}
+                  >
+                    ±{tol}%
+                  </button>
+                ))}
+              </div>
+              <p className="text-[9px] text-slate-500 font-mono italic">Forces optimizer to maintain volume within design limit.</p>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-slate-400 uppercase font-bold tracking-wider block">Iteration Loops</label>
+              <div className="bg-slate-950 p-3 rounded-lg border border-slate-850 space-y-2">
+                <div className="flex justify-between text-xs font-mono font-bold text-cyan-400">
+                  <span>Max Steps:</span>
+                  <span>{optMaxIters}</span>
+                </div>
+                <input
+                  type="range"
+                  min="10"
+                  max="50"
+                  step="5"
+                  value={optMaxIters}
+                  onChange={(e) => setOptMaxIters(Number(e.target.value))}
+                  className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
+                />
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800/60 my-2"></div>
+
+            {/* Optimizer Actions */}
+            <div className="space-y-2" id="optimizer_actions">
+              <button
+                type="button"
+                onClick={handleStartOptimizer}
+                className={`w-full py-2.5 px-3 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition-all ${
+                  isOptimizing 
+                    ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-[0_0_12px_rgba(217,119,6,0.3)]' 
+                    : 'bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-[0_0_12px_rgba(34,211,238,0.3)]'
+                }`}
+              >
+                <Play className="w-3.5 h-3.5 fill-current" />
+                <span>{isOptimizing ? 'Pause Optimizer' : optCurrentIter > 0 ? 'Restart Optimizer' : 'Run Optimizer'}</span>
+              </button>
+
+              {optBestTrial && (
+                <button
+                  type="button"
+                  onClick={handleApplyOptimization}
+                  disabled={isOptimizing}
+                  className="w-full py-2 px-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:hover:bg-emerald-600 text-white font-bold text-xs rounded-lg flex items-center justify-center space-x-1.5 transition shadow-[0_0_8px_rgba(16,185,129,0.2)]"
+                >
+                  <CheckCircle className="w-3.5 h-3.5" />
+                  <span>Apply Optimized Design</span>
+                </button>
+              )}
             </div>
           </div>
+        ) : (
+          /* Solver select menu */
+          <div className="p-4 space-y-4" id="solver_select_and_settings">
+            <div className="space-y-1.5">
+              <label className="text-[10px] text-slate-400 uppercase font-bold tracking-wider block">Numerical Engine</label>
+              <div className="grid grid-cols-1 gap-1.5">
+                <button
+                  onClick={() => { handleResetSolver(); setSelectedSolver('cfd'); }}
+                  className={`w-full text-left p-3 rounded-lg border transition font-sans ${selectedSolver === 'cfd' ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
+                >
+                  <div className="font-bold text-xs">Symmetric RANS CFD</div>
+                  <div className="text-[9px] text-slate-500 mt-0.5 font-mono">Wave-making hull drag solver</div>
+                </button>
 
-          <div className="border-t border-slate-800/60 my-2"></div>
+                <button
+                  onClick={() => { handleResetSolver(); setSelectedSolver('fea'); }}
+                  className={`w-full text-left p-3 rounded-lg border transition font-sans ${selectedSolver === 'fea' ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
+                >
+                  <div className="font-bold text-xs">Nonlinear Shell FEA</div>
+                  <div className="text-[9px] text-slate-500 mt-0.5 font-mono">Structural strain & stress solver</div>
+                </button>
 
-          {/* Start Actions */}
-          <div className="flex space-x-2 pt-1" id="solver_action_buttons">
-            <button
-              onClick={handleStartSolver}
-              className={`flex-1 py-2 px-3 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition-all ${
-                isSolving 
-                  ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-[0_0_12px_rgba(217,119,6,0.3)]' 
-                  : 'bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-[0_0_12px_rgba(34,211,238,0.3)]'
-              }`}
-            >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              <span>{isSolving ? 'Pause Solver' : currentIteration > 0 ? 'Resume Solver' : 'Run Solver'}</span>
-            </button>
-            <button
-              onClick={handleResetSolver}
-              className="px-2.5 bg-slate-950 hover:bg-slate-850 border border-slate-800 rounded-lg text-slate-400 hover:text-slate-100 transition"
-              title="Reset Solver to Initialized State"
-            >
-              <RotateCw className="w-3.5 h-3.5" />
-            </button>
+                <button
+                  onClick={() => { handleResetSolver(); setSelectedSolver('hydro'); }}
+                  className={`w-full text-left p-3 rounded-lg border transition font-sans ${selectedSolver === 'hydro' ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400' : 'bg-slate-950/40 border-slate-850 hover:bg-slate-900 text-slate-300'}`}
+                >
+                  <div className="font-bold text-xs">BEM Hydrostatics</div>
+                  <div className="text-[9px] text-slate-500 mt-0.5 font-mono">Surface boundary stability solver</div>
+                </button>
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800/60 my-2"></div>
+
+            {/* Configuration inputs */}
+            <div className="space-y-3 font-mono text-xs">
+              <h4 className="text-[10px] text-slate-400 uppercase font-bold tracking-wider flex items-center space-x-1">
+                <Sliders className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Mesh & Convergence</span>
+              </h4>
+
+              {/* Mesh density selector */}
+              <div className="space-y-1 bg-slate-950 p-2.5 rounded-lg border border-slate-850">
+                <label className="text-[10px] text-slate-500 uppercase block font-bold">Mesh Element Density</label>
+                <select
+                  value={meshDensity}
+                  onChange={(e) => { handleResetSolver(); setMeshDensity(e.target.value as any); }}
+                  className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-cyan-400 outline-none"
+                >
+                  <option value="coarse">Coarse Grid (Fast & Rough)</option>
+                  <option value="medium">Medium Grid (Standard CAD)</option>
+                  <option value="fine">Fine Grid (Production Accurate)</option>
+                  <option value="ultra">Ultra-Fine Grid (Research Grade)</option>
+                </select>
+              </div>
+
+              {/* Target Tolerance */}
+              <div className="space-y-1 bg-slate-950 p-2.5 rounded-lg border border-slate-850">
+                <label className="text-[10px] text-slate-500 uppercase block font-bold">Convergence limit</label>
+                <select
+                  value={tolerance}
+                  onChange={(e) => { handleResetSolver(); setTolerance(Number(e.target.value)); }}
+                  className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-cyan-400 outline-none"
+                >
+                  <option value={0.01}>1.0e-2 (Fast convergence)</option>
+                  <option value={0.001}>1.0e-3 (Draft precision)</option>
+                  <option value={0.0001}>1.0e-4 (Standard CAD rule)</option>
+                  <option value={0.00001}>1.0e-5 (High precision)</option>
+                </select>
+              </div>
+
+              {/* Max Iterations */}
+              <div className="space-y-1 bg-slate-950 p-2.5 rounded-lg border border-slate-850">
+                <div className="flex justify-between">
+                  <span className="text-[10px] text-slate-500 font-bold uppercase">Max Loops</span>
+                  <span className="text-cyan-400 font-bold">{maxIterations}</span>
+                </div>
+                <input
+                  type="range"
+                  min="50"
+                  max="300"
+                  step="25"
+                  value={maxIterations}
+                  onChange={(e) => { handleResetSolver(); setMaxIterations(Number(e.target.value)); }}
+                  className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
+                />
+              </div>
+            </div>
+
+            <div className="border-t border-slate-800/60 my-2"></div>
+
+            {/* Start Actions */}
+            <div className="flex space-x-2 pt-1" id="solver_action_buttons">
+              <button
+                onClick={handleStartSolver}
+                className={`flex-1 py-2 px-3 rounded-lg font-bold text-xs flex items-center justify-center space-x-1.5 transition-all ${
+                  isSolving 
+                    ? 'bg-amber-600 hover:bg-amber-500 text-white shadow-[0_0_12px_rgba(217,119,6,0.3)]' 
+                    : 'bg-cyan-500 hover:bg-cyan-400 text-slate-950 shadow-[0_0_12px_rgba(34,211,238,0.3)]'
+                }`}
+              >
+                <Play className="w-3.5 h-3.5 fill-current" />
+                <span>{isSolving ? 'Pause Solver' : currentIteration > 0 ? 'Resume Solver' : 'Run Solver'}</span>
+              </button>
+              <button
+                onClick={handleResetSolver}
+                className="px-2.5 bg-slate-950 hover:bg-slate-850 border border-slate-800 rounded-lg text-slate-400 hover:text-slate-100 transition"
+                title="Reset Solver to Initialized State"
+              >
+                <RotateCw className="w-3.5 h-3.5" />
+              </button>
+            </div>
           </div>
-        </div>
+        )}
       </div>
 
       {/* 2. Center Panel: CFD/FEA Grid Mesh Visualization & Live Convergence Chart */}
@@ -530,6 +818,14 @@ export default function NumericalSolversPanel({ parameters }: NumericalSolversPa
               >
                 <Sliders className="w-3.5 h-3.5" />
                 <span>Parametric Sensitivity Analyzer</span>
+              </button>
+              <button
+                onClick={() => setActiveSubView('optimizer')}
+                className={`px-3 py-1.5 text-[11px] font-semibold rounded-md flex items-center space-x-1.5 transition ${activeSubView === 'optimizer' ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/20 shadow-inner' : 'text-slate-400 hover:text-slate-200 border border-transparent'}`}
+                id="tab_parametric_optimizer"
+              >
+                <Compass className="w-3.5 h-3.5" />
+                <span>Parametric Optimizer</span>
               </button>
             </div>
           </div>
@@ -739,7 +1035,7 @@ export default function NumericalSolversPanel({ parameters }: NumericalSolversPa
               </div>
             </div>
           </>
-        ) : (
+        ) : activeSubView === 'sensitivity' ? (
           /* Real-Time Sensitivity Analyzer view */
           <div className="flex-1 flex flex-col space-y-4 overflow-y-auto pr-1" id="sensitivity_dashboard_view">
             {/* Sensitivity Selection Controls */}
@@ -1201,6 +1497,201 @@ export default function NumericalSolversPanel({ parameters }: NumericalSolversPa
                     </div>
                   );
                 })()}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="flex-1 flex flex-col space-y-4 overflow-y-auto pr-1" id="optimizer_dashboard_view">
+            {/* Top Stat Summary Cards: Baseline vs Best Optimized */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 shrink-0">
+              {/* Baseline Card */}
+              <div className="bg-slate-900/50 rounded-xl border border-slate-800 p-4">
+                <span className="text-[10px] text-slate-500 uppercase font-bold tracking-wider block mb-1">Baseline Hull Design</span>
+                <div className="space-y-1.5">
+                  <div className="flex justify-between text-xs font-mono">
+                    <span className="text-slate-400">Waterplane Fullness (Cwp):</span>
+                    <span className="text-slate-200 font-semibold">{optBaseline ? optBaseline.fullness.toFixed(3) : parameters.fullness.toFixed(3)}</span>
+                  </div>
+                  <div className="flex justify-between text-xs font-mono">
+                    <span className="text-slate-400">Side Wall Flare:</span>
+                    <span className="text-slate-200 font-semibold">{optBaseline ? optBaseline.flare.toFixed(1) : parameters.flare.toFixed(1)}°</span>
+                  </div>
+                  <div className="flex justify-between text-xs font-mono">
+                    <span className="text-slate-400">Displacement Mass:</span>
+                    <span className="text-slate-200 font-semibold">{optBaseline ? optBaseline.displacement.toFixed(1) : '—'} t</span>
+                  </div>
+                  <div className="flex justify-between text-xs font-mono pt-1.5 border-t border-slate-850/60">
+                    <span className="text-slate-400 font-bold">Total Drag ({optSpeed} kn):</span>
+                    <span className="text-slate-200 font-bold">{optBaseline ? `${optBaseline.resistance.toFixed(2)} kN` : '—'}</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Best Optimized Card */}
+              <div className="bg-slate-900/50 rounded-xl border border-purple-500/20 p-4 relative overflow-hidden">
+                <div className="absolute top-0 right-0 bg-purple-500/10 text-purple-400 border-b border-l border-purple-500/20 text-[8px] font-bold font-mono px-2 py-0.5 rounded-bl">
+                  BEST CANDIDATE
+                </div>
+                <span className="text-[10px] text-purple-400 uppercase font-bold tracking-wider block mb-1">Optimized Hull Design</span>
+                {optBestTrial ? (
+                  <div className="space-y-1.5">
+                    <div className="flex justify-between text-xs font-mono">
+                      <span className="text-slate-400">Waterplane Fullness (Cwp):</span>
+                      <span className="text-emerald-400 font-bold">{optBestTrial.fullness.toFixed(3)}</span>
+                    </div>
+                    <div className="flex justify-between text-xs font-mono">
+                      <span className="text-slate-400">Side Wall Flare:</span>
+                      <span className="text-emerald-400 font-bold">{optBestTrial.flare.toFixed(1)}°</span>
+                    </div>
+                    <div className="flex justify-between text-xs font-mono">
+                      <span className="text-slate-400">Displacement Mass:</span>
+                      <span className="text-slate-200 font-semibold">{optBestTrial.displacement.toFixed(1)} t</span>
+                    </div>
+                    <div className="flex justify-between text-xs font-mono pt-1.5 border-t border-slate-850/60">
+                      <span className="text-purple-400 font-bold">Total Drag ({optSpeed} kn):</span>
+                      <span className="text-emerald-400 font-bold">{optBestTrial.resistance.toFixed(2)} kN</span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="h-24 flex items-center justify-center text-slate-500 text-xs italic font-mono">
+                    {isOptimizing ? 'Sweeping space...' : 'Run optimizer to start search'}
+                  </div>
+                )}
+              </div>
+
+              {/* Improvement Metrics Card */}
+              <div className="bg-slate-900/50 rounded-xl border border-emerald-500/20 p-4 flex flex-col justify-between">
+                <span className="text-[10px] text-emerald-400 uppercase font-bold tracking-wider block">Hydrodynamic Efficiency Gain</span>
+                {optBestTrial && optBaseline ? (
+                  <div className="flex-1 flex flex-col justify-center items-center py-2">
+                    {(() => {
+                      const reduction = ((optBaseline.resistance - optBestTrial.resistance) / optBaseline.resistance) * 100;
+                      return (
+                        <>
+                          <span className={`text-3xl font-extrabold font-mono tracking-tight ${reduction > 0 ? 'text-emerald-400' : 'text-slate-400'}`}>
+                            {reduction > 0 ? `-${reduction.toFixed(1)}%` : '0.0%'}
+                          </span>
+                          <span className="text-[10px] text-slate-400 uppercase font-semibold font-mono mt-1 text-center">
+                            {reduction > 0 ? 'Total Drag Reduced! 🎉' : 'No drag reduction found'}
+                          </span>
+                        </>
+                      );
+                    })()}
+                  </div>
+                ) : (
+                  <div className="flex-1 flex items-center justify-center text-slate-500 text-xs italic font-mono">
+                    Awaiting optimization run...
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* 2D Space Probe Visualizer Grid */}
+            <div className="bg-slate-900/40 rounded-xl border border-slate-800 p-4 flex flex-col relative overflow-hidden min-h-[250px] flex-1">
+              <div className="flex items-center justify-between mb-3 border-b border-slate-800/60 pb-2 shrink-0">
+                <span className="text-[10px] font-mono uppercase text-slate-300 font-semibold tracking-wider">
+                  2D Parametric Co-Ordinate Exploration Space
+                </span>
+                <div className="flex items-center space-x-3 text-[8.5px] font-mono">
+                  <div className="flex items-center space-x-1">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span>
+                    <span className="text-slate-400">Valid Probe</span>
+                  </div>
+                  <div className="flex items-center space-x-1">
+                    <span className="w-2 h-2 rounded-full bg-rose-500 inline-block"></span>
+                    <span className="text-slate-400">Violates Volume</span>
+                  </div>
+                  <div className="flex items-center space-x-1 font-bold text-yellow-500 flex items-center">
+                    <span className="inline-block mr-1">⭐</span>
+                    <span className="text-slate-400">Best Design</span>
+                  </div>
+                </div>
+              </div>
+
+              {/* 2D Grid SVG */}
+              <div className="flex-1 relative flex items-center justify-center min-h-[200px]">
+                <svg viewBox="0 0 600 220" className="w-full h-full select-none" id="svg_optimizer_2d_grid">
+                  {/* Axis Grids */}
+                  {Array.from({ length: 6 }).map((_, i) => {
+                    const frac = i / 5;
+                    const x = 60 + frac * 480;
+                    const fullnessVal = 0.5 + frac * 1.5;
+                    return (
+                      <g key={`opt-grid-x-${i}`}>
+                        <line x1={x} y1="15" x2={x} y2="195" stroke="rgba(71,85,105,0.12)" strokeDasharray="3,3" />
+                        <text x={x} y="208" fill="#475569" fontSize="8" fontFamily="monospace" textAnchor="middle">
+                          Cwp {fullnessVal.toFixed(2)}
+                        </text>
+                      </g>
+                    );
+                  })}
+
+                  {Array.from({ length: 5 }).map((_, i) => {
+                    const frac = i / 4;
+                    const y = 15 + frac * 180;
+                    const flareVal = 55 - frac * 70; // -15 to 55 degrees
+                    return (
+                      <g key={`opt-grid-y-${i}`}>
+                        <line x1="60" y1={y} x2="540" y2={y} stroke="rgba(71,85,105,0.12)" strokeDasharray="3,3" />
+                        <text x="50" y={y + 3} fill="#475569" fontSize="8" fontFamily="monospace" textAnchor="end">
+                          {flareVal.toFixed(0)}°
+                        </text>
+                      </g>
+                    );
+                  })}
+
+                  {/* Axis titles */}
+                  <text x="300" y="219" fill="#94a3b8" fontSize="8" fontFamily="monospace" textAnchor="middle" fontWeight="bold">
+                    WATERPLANE FULLNESS (Cwp)
+                  </text>
+                  <text x="15" y="105" fill="#94a3b8" fontSize="8" fontFamily="monospace" textAnchor="middle" fontWeight="bold" transform="rotate(-90, 15, 105)">
+                    SIDE WALL FLARE (DEGREES)
+                  </text>
+
+                  {/* Scatter plots of all trials */}
+                  {optTrials.map((t, idx) => {
+                    // Map fullness [0.5, 2.0] to X [60, 540]
+                    const x = 60 + ((t.fullness - 0.5) / 1.5) * 480;
+                    // Map flare [-15, 55] to Y [195, 15]
+                    const y = 195 - ((t.flare - (-15)) / 70) * 180;
+
+                    const isBest = optBestTrial && optBestTrial.iteration === t.iteration;
+                    
+                    return (
+                      <g key={`trial-dot-${idx}`}>
+                        {isBest ? (
+                          <>
+                            <circle cx={x} cy={y} r="8" fill="none" stroke="#f59e0b" strokeWidth="1.5" />
+                            <text x={x} y={y + 3} fontSize="10" textAnchor="middle" className="select-none">⭐</text>
+                          </>
+                        ) : (
+                          <circle
+                            cx={x}
+                            cy={y}
+                            r="4.5"
+                            fill={t.status === 'valid' ? '#10b981' : '#f43f5e'}
+                            stroke="#0f172a"
+                            strokeWidth="1"
+                          />
+                        )}
+                      </g>
+                    );
+                  })}
+
+                  {/* Current Active Blinking Scanner */}
+                  {isOptimizing && optTrials.length > 0 && (() => {
+                    const latest = optTrials[optTrials.length - 1];
+                    const x = 60 + ((latest.fullness - 0.5) / 1.5) * 480;
+                    const y = 195 - ((latest.flare - (-15)) / 70) * 180;
+                    return (
+                      <g>
+                        <circle cx={x} cy={y} r="10" fill="none" stroke="#22d3ee" strokeWidth="1.5" />
+                        <line x1={x - 12} y1={y} x2={x + 12} y2={y} stroke="#22d3ee" strokeWidth="1" />
+                        <line x1={x} y1={y - 12} x2={x} y2={y + 12} stroke="#22d3ee" strokeWidth="1" />
+                      </g>
+                    );
+                  })()}
+                </svg>
               </div>
             </div>
           </div>

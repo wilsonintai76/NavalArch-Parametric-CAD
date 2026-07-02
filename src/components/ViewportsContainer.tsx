@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { HullParameters } from '../types';
 import { 
   generateHullMesh, 
@@ -16,7 +16,7 @@ import {
   calculateSimplifiedCFD,
   getStationPoints
 } from '../utils/hullGeometry';
-import { Maximize2, Minimize2, Move, Rotate3d, Compass, Eye, Scissors, Wind, RefreshCw, Layers, Scale, Waves, Activity } from 'lucide-react';
+import { Maximize2, Minimize2, Move, Rotate3d, Compass, Eye, Scissors, Wind, RefreshCw, Layers, Scale, Waves, Activity, Ruler } from 'lucide-react';
 
 const MATERIALS: Record<string, { name: string; yield: number; density: number; modulus: number }> = {
   steel: { name: 'Mild Steel A36', yield: 250, density: 7850, modulus: 200 },
@@ -32,18 +32,101 @@ const LOAD_CASES: Record<string, { name: string; bendingFactor: number; pressure
   slamming: { name: 'Dynamic Head Seas Bow Slamming', bendingFactor: 1.6, pressureFactor: 1.0, slammingFactor: 2.5 }
 };
 
+// Helper to calculate 2D station stability (submerged area centroid and GZ)
+export function computeStationStability(uCut: number, heelAngleRad: number, params: HullParameters) {
+  const points = getStationPoints(uCut, params, 30);
+  if (points.length < 2) {
+    return { GZ: 0, yB: 0, zB: 0, area: 0, zKeel: 0, zDeck: params.depth, KG: params.depth * 0.58 };
+  }
+  
+  const zKeel = points[0].z;
+  const zDeck = points[points.length - 1].z;
+  const KG = params.depth * 0.58;
+  const draft = params.draft;
+
+  let totalArea = 0;
+  let sumY = 0;
+  let sumZ = 0;
+
+  const stepsZ = 25;
+  const stepsY = 15;
+
+  const dz = (zDeck - zKeel) / stepsZ;
+
+  for (let iz = 0; iz < stepsZ; iz++) {
+    const zCurr = zKeel + (iz + 0.5) * dz;
+    
+    // Interpolate half-beam at zCurr
+    let yHalf = 0;
+    for (let i = 0; i < points.length - 1; i++) {
+      const p1 = points[i];
+      const p2 = points[i + 1];
+      if (zCurr >= p1.z && zCurr <= p2.z) {
+        const frac = (zCurr - p1.z) / (p2.z - p1.z || 0.001);
+        yHalf = p1.y + frac * (p2.y - p1.y);
+        break;
+      }
+    }
+    if (yHalf <= 0) continue;
+
+    const dy = (2 * yHalf) / stepsY;
+    for (let iy = 0; iy < stepsY; iy++) {
+      const yCurr = -yHalf + (iy + 0.5) * dy;
+      
+      // Calculate world coordinate under heel angle
+      // Rotated around G = (0, KG)
+      const zWorld = KG + yCurr * Math.sin(heelAngleRad) + (zCurr - KG) * Math.cos(heelAngleRad);
+      
+      if (zWorld <= draft) {
+        const dA = dy * dz;
+        totalArea += dA;
+        sumY += yCurr * dA;
+        sumZ += zCurr * dA;
+      }
+    }
+  }
+
+  if (totalArea <= 0) {
+    return { GZ: 0, yB: 0, zB: zKeel, area: 0, zKeel, zDeck, KG };
+  }
+  const yB = sumY / totalArea;
+  const zB = sumZ / totalArea;
+
+  const GZ = yB * Math.cos(heelAngleRad) + (zB - KG) * Math.sin(heelAngleRad);
+  return { GZ, yB, zB, area: totalArea, zKeel, zDeck, KG };
+}
+
+import { Hydrostatics } from '../types';
+
 interface ViewportsContainerProps {
   parameters: HullParameters;
   onParameterChange: (params: Partial<HullParameters>) => void;
   collaborators?: { name: string; color: string; activePanel: string }[];
+  hydrostatics?: Hydrostatics;
+  activeViewportOverride?: 'all' | '3d' | 'plan' | 'profile' | 'body';
 }
 
 export default function ViewportsContainer({
   parameters,
   onParameterChange,
-  collaborators = []
+  collaborators = [],
+  hydrostatics: hydrostaticsProp,
+  activeViewportOverride
 }: ViewportsContainerProps) {
-  const [activeViewport, setActiveViewport] = useState<'all' | '3d' | 'plan' | 'profile' | 'body'>('all');
+  const [activeViewport, setActiveViewport] = useState<'all' | '3d' | 'plan' | 'profile' | 'body'>(
+    activeViewportOverride || 'all'
+  );
+
+  // Sync state if activeViewportOverride changes
+  useEffect(() => {
+    if (activeViewportOverride) {
+      setActiveViewport(activeViewportOverride);
+    }
+  }, [activeViewportOverride]);
+
+  const hydrostatics = useMemo(() => {
+    return hydrostaticsProp || calculateHydrostatics(parameters);
+  }, [hydrostaticsProp, parameters]);
 
   // Multi-Mode Visualization States
   const [visMode, setVisMode] = useState<'shaded' | 'wireframe' | 'slicing' | 'flow' | 'buoyancy' | 'stress'>('shaded');
@@ -51,6 +134,7 @@ export default function ViewportsContainer({
   const [buoyancyScale, setBuoyancyScale] = useState<'pressure' | 'force'>('pressure');
   const [slicePlane, setSlicePlane] = useState<'X' | 'Y' | 'Z'>('X');
   const [slicePosition, setSlicePosition] = useState<number>(50); // 0 to 100%
+  const [hudHeelAngle, setHudHeelAngle] = useState<number>(20); // 0 to 90 degrees for interactive HUD cross-section stability heeling
   const [cfdSpeedKnots, setCfdSpeedKnots] = useState<number>(18);
   const [cfdDetail, setCfdDetail] = useState<'low' | 'medium' | 'high'>('medium');
 
@@ -78,6 +162,12 @@ export default function ViewportsContainer({
   const [isDragging3D, setIsDragging3D] = useState(false);
   const dragStartRef = useRef({ x: 0, y: 0 });
 
+  // Measurement Tool States
+  const [isMeasuringMode, setIsMeasuringMode] = useState<boolean>(false);
+  const [measuredPoint1, setMeasuredPoint1] = useState<Point3D | null>(null);
+  const [measuredPoint2, setMeasuredPoint2] = useState<Point3D | null>(null);
+  const mouseDownPosRef = useRef({ x: 0, y: 0 });
+
   // Mesh data
   const mesh = generateHullMesh(parameters, 15, 20);
 
@@ -90,10 +180,78 @@ export default function ViewportsContainer({
   // Dragging interaction states for 2D plans
   const [activeHandle, setActiveHandle] = useState<{ view: string; id: string } | null>(null);
 
+  // Projection helper for 3D-to-2D mouse picking
+  const projectPoint = (pt: Point3D, w: number, h: number) => {
+    const cx = w / 2;
+    const cy = h * 0.6;
+    const scale = Math.min(w, h) * 0.05 * zoom;
+    const dVal = 100;
+
+    const xShift = pt.x - parameters.length / 2;
+    const yShift = pt.y;
+    const zShift = pt.z - parameters.depth / 2;
+
+    const x1 = xShift * Math.cos(yaw) - yShift * Math.sin(yaw);
+    const y1 = xShift * Math.sin(yaw) + yShift * Math.cos(yaw);
+
+    const z2 = zShift * Math.cos(pitch) - y1 * Math.sin(pitch);
+    const y2 = zShift * Math.sin(pitch) + y1 * Math.cos(pitch);
+
+    const dist = y2 + dVal;
+    const sx = cx + (x1 / dist) * scale * 100;
+    const sy = cy - (z2 / dist) * scale * 100;
+
+    return { x: sx, y: sy };
+  };
+
+  // Find the closest mesh vertex in 2D screen space
+  const findClosestHullPoint = (clientX: number, clientY: number): Point3D | null => {
+    const canvas = canvas3D.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const clickX = clientX - rect.left;
+    const clickY = clientY - rect.top;
+
+    const w = canvas.width;
+    const h = canvas.height;
+
+    let closestPt: Point3D | null = null;
+    let minDistanceSq = Infinity;
+
+    // Iterate through all mesh stations and points (checking both Starboard and Port sides)
+    for (let s = 0; s < mesh.length; s++) {
+      for (let p = 0; p < mesh[s].length; p++) {
+        const ptsToCheck = [
+          mesh[s][p], // Starboard
+          { ...mesh[s][p], y: -mesh[s][p].y } // Port
+        ];
+
+        for (const pt of ptsToCheck) {
+          const proj = projectPoint(pt, w, h);
+          const dx = proj.x - clickX;
+          const dy = proj.y - clickY;
+          const distSq = dx * dx + dy * dy;
+
+          if (distSq < minDistanceSq) {
+            minDistanceSq = distSq;
+            closestPt = pt;
+          }
+        }
+      }
+    }
+
+    // Must be close enough to a mesh vertex (e.g. within 50px on screen)
+    if (minDistanceSq < 50 * 50) {
+      return closestPt;
+    }
+    return null;
+  };
+
   // 3D Mouse Event Handlers
   const handleMouseDown3D = (e: React.MouseEvent) => {
     setIsDragging3D(true);
     dragStartRef.current = { x: e.clientX, y: e.clientY };
+    mouseDownPosRef.current = { x: e.clientX, y: e.clientY };
   };
 
   const handleMouseMove3D = (e: React.MouseEvent) => {
@@ -105,7 +263,31 @@ export default function ViewportsContainer({
     dragStartRef.current = { x: e.clientX, y: e.clientY };
   };
 
-  const handleMouseUp3D = () => {
+  const handleMouseUp3D = (e: React.MouseEvent) => {
+    setIsDragging3D(false);
+
+    // Calculate click distance to distinguish click vs dragging rotation
+    const dx = e.clientX - mouseDownPosRef.current.x;
+    const dy = e.clientY - mouseDownPosRef.current.y;
+    const clickDistance = Math.sqrt(dx * dx + dy * dy);
+
+    if (clickDistance < 4 && isMeasuringMode) {
+      const clickedPt = findClosestHullPoint(e.clientX, e.clientY);
+      if (clickedPt) {
+        if (!measuredPoint1) {
+          setMeasuredPoint1(clickedPt);
+        } else if (!measuredPoint2) {
+          setMeasuredPoint2(clickedPt);
+        } else {
+          // Reset and start new measurement
+          setMeasuredPoint1(clickedPt);
+          setMeasuredPoint2(null);
+        }
+      }
+    }
+  };
+
+  const handleMouseLeave3D = () => {
     setIsDragging3D(false);
   };
 
@@ -131,7 +313,10 @@ export default function ViewportsContainer({
     buoyancyDensity,
     buoyancyScale,
     stressMaterial,
-    stressLoadCase
+    stressLoadCase,
+    isMeasuringMode,
+    measuredPoint1,
+    measuredPoint2
   ]);
 
   const drawAllViewports = () => {
@@ -680,8 +865,61 @@ export default function ViewportsContainer({
 
     // Draw Waterline Plane Overlay (Design Draft)
     if (visMode !== 'slicing') {
-      ctx.strokeStyle = 'rgba(6, 182, 212, 0.4)'; // Cyan waterline
-      ctx.lineWidth = 1.0;
+      // 1. Draw a beautiful translucent sea surface plane
+      const xMin = -parameters.length * 0.3;
+      const xMax = parameters.length * 1.3;
+      const yMin = -parameters.beam * 1.8;
+      const yMax = parameters.beam * 1.8;
+
+      const p1 = project({ x: xMin, y: yMin, z: parameters.draft });
+      const p2 = project({ x: xMax, y: yMin, z: parameters.draft });
+      const p3 = project({ x: xMax, y: yMax, z: parameters.draft });
+      const p4 = project({ x: xMin, y: yMax, z: parameters.draft });
+
+      ctx.beginPath();
+      ctx.moveTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.lineTo(p3.x, p3.y);
+      ctx.lineTo(p4.x, p4.y);
+      ctx.closePath();
+
+      // Sea glass cyan fill & border
+      ctx.fillStyle = 'rgba(6, 182, 212, 0.12)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(6, 182, 212, 0.35)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // 2. Draw reference grid lines on the sea surface
+      ctx.strokeStyle = 'rgba(6, 182, 212, 0.18)';
+      ctx.lineWidth = 0.5;
+      
+      // Longitudinal grid lines
+      const gridLineCounts = 5;
+      for (let i = 0; i <= gridLineCounts; i++) {
+        const gy = yMin + (i / gridLineCounts) * (yMax - yMin);
+        const gpStart = project({ x: xMin, y: gy, z: parameters.draft });
+        const gpEnd = project({ x: xMax, y: gy, z: parameters.draft });
+        ctx.beginPath();
+        ctx.moveTo(gpStart.x, gpStart.y);
+        ctx.lineTo(gpEnd.x, gpEnd.y);
+        ctx.stroke();
+      }
+
+      // Transverse grid lines
+      for (let i = 0; i <= gridLineCounts; i++) {
+        const gx = xMin + (i / gridLineCounts) * (xMax - xMin);
+        const gpStart = project({ x: gx, y: yMin, z: parameters.draft });
+        const gpEnd = project({ x: gx, y: yMax, z: parameters.draft });
+        ctx.beginPath();
+        ctx.moveTo(gpStart.x, gpStart.y);
+        ctx.lineTo(gpEnd.x, gpEnd.y);
+        ctx.stroke();
+      }
+
+      // 3. Highlight the waterline intersection on the hull
+      ctx.strokeStyle = '#22d3ee'; // Brighter cyan
+      ctx.lineWidth = 1.8;
       for (let s = 0; s < numStations - 1; s++) {
         const u1 = s / (numStations - 1);
         const u2 = (s + 1) / (numStations - 1);
@@ -924,7 +1162,11 @@ export default function ViewportsContainer({
 
     // 2. Compute Hydrostatic Center of Buoyancy (B), Center of Gravity (G), Metacenter (M)
     const ptCoB = { x: hydro.lcb, y: 0, z: hydro.vcb };
-    const ptCoG = { x: parameters.length * 0.48, y: 0, z: parameters.depth * 0.58 };
+    const ptCoG = {
+      x: parameters.cogLcg !== undefined ? parameters.cogLcg : parameters.length * 0.48,
+      y: 0,
+      z: parameters.cogVcg !== undefined ? parameters.cogVcg : parameters.depth * 0.58
+    };
     const ptMeta = { x: hydro.lcb, y: 0, z: hydro.vcb + hydro.bmt };
 
     const projB = project(ptCoB);
@@ -968,6 +1210,586 @@ export default function ViewportsContainer({
     ctx.stroke();
     ctx.fillStyle = '#ffffff';
     ctx.fillText('M (Meta)', projM.x + 8, projM.y + 3);
+
+    // Draw Measurement points if they exist
+    if (measuredPoint1) {
+      const proj1 = project(measuredPoint1);
+      
+      // Draw first point marker (Emerald Green)
+      ctx.beginPath();
+      ctx.arc(proj1.x, proj1.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = '#10b981';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.fill();
+      ctx.stroke();
+
+      // Outer ring
+      ctx.beginPath();
+      ctx.arc(proj1.x, proj1.y, 10, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(16, 185, 129, 0.4)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Label
+      ctx.fillStyle = '#10b981';
+      ctx.font = 'bold 10px monospace';
+      ctx.fillText('PT1', proj1.x + 10, proj1.y - 10);
+    }
+
+    if (measuredPoint2) {
+      const proj2 = project(measuredPoint2);
+      
+      // Draw second point marker (Amber)
+      ctx.beginPath();
+      ctx.arc(proj2.x, proj2.y, 6, 0, Math.PI * 2);
+      ctx.fillStyle = '#f59e0b';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1.5;
+      ctx.fill();
+      ctx.stroke();
+
+      // Outer ring
+      ctx.beginPath();
+      ctx.arc(proj2.x, proj2.y, 10, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(245, 158, 11, 0.4)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Label
+      ctx.fillStyle = '#f59e0b';
+      ctx.font = 'bold 10px monospace';
+      ctx.fillText('PT2', proj2.x + 10, proj2.y - 10);
+    }
+
+    if (measuredPoint1 && measuredPoint2) {
+      const proj1 = project(measuredPoint1);
+      const proj2 = project(measuredPoint2);
+
+      // Draw dashed line connecting them
+      ctx.beginPath();
+      ctx.moveTo(proj1.x, proj1.y);
+      ctx.lineTo(proj2.x, proj2.y);
+      ctx.strokeStyle = '#38bdf8'; // light cyan/blue
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4, 4]);
+      ctx.stroke();
+      ctx.setLineDash([]); // Reset line dash
+
+      // Calculate distance
+      const dx = measuredPoint2.x - measuredPoint1.x;
+      const dy = measuredPoint2.y - measuredPoint1.y;
+      const dz = measuredPoint2.z - measuredPoint1.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+      // Draw a sleek dimension label on the line
+      const midX = (proj1.x + proj2.x) / 2;
+      const midY = (proj1.y + proj2.y) / 2;
+
+      ctx.save();
+      ctx.fillStyle = 'rgba(15, 23, 42, 0.95)'; // slate-900 transparent
+      ctx.strokeStyle = '#38bdf8'; // light blue border
+      ctx.lineWidth = 1;
+      
+      const txt = `${dist.toFixed(2)} m`;
+      ctx.font = 'bold 11px monospace';
+      const txtWidth = ctx.measureText(txt).width;
+      
+      ctx.beginPath();
+      ctx.roundRect(midX - txtWidth / 2 - 6, midY - 10, txtWidth + 12, 18, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#38bdf8'; // light blue text
+      ctx.textAlign = 'center';
+      ctx.fillText(txt, midX, midY + 3);
+      ctx.restore();
+    }
+
+    // --- Render Automatic Visual Overlay of Frame Stations on Hull ---
+    const showFrameOverlay = parameters.showFrameOverlay ?? true;
+    const frameSpacing = parameters.frameSpacing ?? 0.8;
+    const frameAngle = parameters.frameAngle ?? 0;
+    const frameOverlayColor = parameters.frameOverlayColor ?? 'cyan';
+
+    const themeColors = {
+      cyan: '#22d3ee',
+      amber: '#fbbf24',
+      emerald: '#34d399'
+    };
+    const activeHexColor = themeColors[frameOverlayColor as keyof typeof themeColors] || '#22d3ee';
+
+    if (showFrameOverlay) {
+      const totalFrames = Math.floor(parameters.length / frameSpacing);
+      for (let idx = 1; idx <= totalFrames; idx++) {
+        const xVal = idx * frameSpacing;
+        const u = Math.max(0.01, Math.min(0.99, xVal / parameters.length));
+        
+        const pts = getStationPoints(u, parameters, 24);
+        if (pts.length > 0) {
+          const deckZ = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+          const keelZ = getKeelHeight(u, parameters.depth);
+          const yMid = (deckZ + keelZ) / 2;
+          const rad = (frameAngle * Math.PI) / 180;
+
+          // Apply orientation angle shift
+          const tiltedPts = pts.map(pt => {
+            const zOffset = pt.z - yMid;
+            const dx = zOffset * Math.sin(rad);
+            return { x: xVal + dx, y: pt.y, z: pt.z };
+          });
+
+          ctx.beginPath();
+          tiltedPts.forEach((pt, pIdx) => {
+            const proj = project(pt);
+            if (pIdx === 0) ctx.moveTo(proj.x, proj.y);
+            else ctx.lineTo(proj.x, proj.y);
+          });
+          // Mirror to port side
+          for (let pIdx = tiltedPts.length - 1; pIdx >= 0; pIdx--) {
+            const pt = tiltedPts[pIdx];
+            const proj = project({ ...pt, y: -pt.y });
+            ctx.lineTo(proj.x, proj.y);
+          }
+          ctx.closePath();
+
+          ctx.strokeStyle = activeHexColor + '80'; // 50% opacity for frames
+          ctx.lineWidth = 1.0;
+          ctx.stroke();
+
+          // Label every 10th frame
+          if (idx % 10 === 0) {
+            const labelPt = project({ x: xVal, y: 0, z: deckZ + 0.1 });
+            ctx.fillStyle = activeHexColor;
+            ctx.font = '7px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(`FR-${idx}`, labelPt.x, labelPt.y);
+          }
+        }
+      }
+    }
+
+    // --- Render Dynamic Bulkheads inside 3D Viewport ---
+    if (parameters.bulkheads && parameters.bulkheads.length > 0) {
+      parameters.bulkheads.forEach(bh => {
+        if (bh.type === 'transverse') {
+          const u = Math.max(0, Math.min(1, bh.position / parameters.length));
+          const pts = getStationPoints(u, parameters, 24);
+          if (pts.length === 0) return;
+
+          // 1. Draw boundary wireframe (indigo / violet) with selected clash highlight
+          const isSelected = parameters.selectedBulkheadId === bh.id;
+          const isMoving = isSelected && parameters.isMovingBulkhead;
+
+          ctx.save();
+          ctx.beginPath();
+          pts.forEach((pt, idx) => {
+            const proj = project(pt);
+            if (idx === 0) ctx.moveTo(proj.x, proj.y);
+            else ctx.lineTo(proj.x, proj.y);
+          });
+          // Mirror to port side
+          for (let idx = pts.length - 1; idx >= 0; idx--) {
+            const pt = pts[idx];
+            const proj = project({ ...pt, y: -pt.y });
+            ctx.lineTo(proj.x, proj.y);
+          }
+          ctx.closePath();
+          
+          ctx.strokeStyle = isSelected ? '#ef4444' : '#6366f1'; // Glowing red if selected
+          ctx.lineWidth = isSelected ? 3.0 : 2.2;
+          ctx.fillStyle = isSelected 
+            ? (isMoving ? 'rgba(239, 68, 68, 0.25)' : 'rgba(239, 68, 68, 0.15)') 
+            : 'rgba(99, 102, 241, 0.15)'; 
+          ctx.fill();
+          ctx.stroke();
+          
+          if (isSelected) {
+            // High-fidelity glowing collision outline overlay (clash detection contact line with hull shell)
+            ctx.beginPath();
+            pts.forEach((pt, idx) => {
+              const proj = project(pt);
+              if (idx === 0) ctx.moveTo(proj.x, proj.y);
+              else ctx.lineTo(proj.x, proj.y);
+            });
+            for (let idx = pts.length - 1; idx >= 0; idx--) {
+              const pt = pts[idx];
+              const proj = project({ ...pt, y: -pt.y });
+              ctx.lineTo(proj.x, proj.y);
+            }
+            ctx.closePath();
+            
+            ctx.strokeStyle = '#f59e0b'; // Amber neon clash light
+            ctx.lineWidth = 4.5;
+            ctx.shadowColor = '#ef4444';
+            ctx.shadowBlur = 12 + 4 * Math.sin(Date.now() * 0.01);
+            if (isMoving) {
+              ctx.setLineDash([8, 4]);
+              ctx.lineDashOffset = -(Date.now() * 0.1) % 12;
+            }
+            ctx.stroke();
+          }
+          ctx.restore();
+
+          // 2. Vertical Stiffeners (Wireframe Subdivisions)
+          const maxBeamAtBh = pts[pts.length - 1].y;
+          const deckZ = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+          const keelZ = getKeelHeight(u, parameters.depth);
+          const heightDiff = deckZ - keelZ;
+          
+          [-0.6, -0.3, 0, 0.3, 0.6].forEach(f => {
+            const yOffset = f * maxBeamAtBh;
+            // Find appropriate bottom z by linear interpolation of station points
+            let bZ = keelZ;
+            let closestDist = Infinity;
+            pts.forEach(p => {
+              const dist = Math.abs(p.y - Math.abs(yOffset));
+              if (dist < closestDist) {
+                closestDist = dist;
+                bZ = p.z;
+              }
+            });
+            const projB = project({ x: bh.position, y: yOffset, z: bZ });
+            const projT = project({ x: bh.position, y: yOffset, z: deckZ });
+            ctx.beginPath();
+            ctx.moveTo(projB.x, projB.y);
+            ctx.lineTo(projT.x, projT.y);
+            ctx.strokeStyle = 'rgba(129, 140, 248, 0.35)';
+            ctx.lineWidth = 1.0;
+            ctx.stroke();
+          });
+
+          // 3. Horizontal Deck Stringers (Wireframe Subdivisions)
+          [0.3, 0.6, 0.9].forEach(fh => {
+            const zVal = keelZ + heightDiff * fh;
+            let halfB = 0;
+            for (let idx = 0; idx < pts.length - 1; idx++) {
+              const p1 = pts[idx];
+              const p2 = pts[idx + 1];
+              if ((p1.z <= zVal && p2.z >= zVal) || (p1.z >= zVal && p2.z <= zVal)) {
+                const frac = (zVal - p1.z) / (p2.z - p1.z || 1);
+                halfB = p1.y + frac * (p2.y - p1.y);
+                break;
+              }
+            }
+            if (halfB > 0) {
+              const projL = project({ x: bh.position, y: -halfB, z: zVal });
+              const projR = project({ x: bh.position, y: halfB, z: zVal });
+              ctx.beginPath();
+              ctx.moveTo(projL.x, projL.y);
+              ctx.lineTo(projR.x, projR.y);
+              ctx.strokeStyle = 'rgba(129, 140, 248, 0.35)';
+              ctx.lineWidth = 1.0;
+              ctx.stroke();
+            }
+          });
+
+          // Label bulkhead
+          const topPt = project({ x: bh.position, y: 0, z: deckZ + 0.5 });
+          ctx.fillStyle = '#a5b4fc';
+          ctx.font = 'bold 8px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(`BH-T ${bh.position.toFixed(1)}m`, topPt.x, topPt.y);
+
+        } else if (bh.type === 'longitudinal') {
+          // Longitudinal Bulkhead at offset y = bh.position
+          const absY = Math.abs(bh.position);
+          
+          // Compute profile
+          const profile: { x: number; zBottom: number; zTop: number; active: boolean }[] = [];
+          for (let s = 0; s < numStations; s++) {
+            const u = s / (numStations - 1);
+            const x = u * parameters.length;
+            const station = mesh[s];
+            const zDeck = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+            const zKeel = getKeelHeight(u, parameters.depth);
+            
+            let zBottom = zKeel;
+            let zTop = zDeck;
+            let active = false;
+            
+            let foundIntersect = false;
+            for (let p = 0; p < station.length - 1; p++) {
+              const p1 = station[p];
+              const p2 = station[p + 1];
+              if ((p1.y <= absY && p2.y >= absY) || (p1.y >= absY && p2.y <= absY)) {
+                const frac = (absY - p1.y) / (p2.y - p1.y || 1);
+                zBottom = p1.z + frac * (p2.z - p1.z);
+                foundIntersect = true;
+                break;
+              }
+            }
+            
+            if (foundIntersect) {
+              active = true;
+            } else {
+              const maxHalfB = station[station.length - 1].y;
+              if (absY <= maxHalfB) {
+                zBottom = zKeel;
+                active = true;
+              } else {
+                active = false;
+              }
+            }
+            profile.push({ x, zBottom, zTop, active });
+          }
+
+          // Gather active segments to draw
+          const activeSegments: { x: number; zBottom: number; zTop: number }[] = profile.filter(p => p.active);
+          if (activeSegments.length > 1) {
+            // Draw profile polygon
+            ctx.beginPath();
+            // Top deck edge (forward to aft)
+            activeSegments.forEach((seg, idx) => {
+              const proj = project({ x: seg.x, y: bh.position, z: seg.zTop });
+              if (idx === 0) ctx.moveTo(proj.x, proj.y);
+              else ctx.lineTo(proj.x, proj.y);
+            });
+            // Bottom keel edge (aft to forward)
+            for (let idx = activeSegments.length - 1; idx >= 0; idx--) {
+              const seg = activeSegments[idx];
+              const proj = project({ x: seg.x, y: bh.position, z: seg.zBottom });
+              ctx.lineTo(proj.x, proj.y);
+            }
+            ctx.closePath();
+            
+            const isSelected = parameters.selectedBulkheadId === bh.id;
+            const isMoving = isSelected && parameters.isMovingBulkhead;
+
+            ctx.save();
+            ctx.strokeStyle = isSelected ? '#ef4444' : '#f43f5e'; // Glowing red if selected
+            ctx.lineWidth = isSelected ? 3.0 : 2.2;
+            ctx.fillStyle = isSelected 
+              ? (isMoving ? 'rgba(239, 68, 68, 0.25)' : 'rgba(239, 68, 68, 0.15)') 
+              : 'rgba(244, 63, 94, 0.12)'; // Translucent rose partition fill
+            ctx.fill();
+            ctx.stroke();
+
+            if (isSelected) {
+              // High-fidelity glowing collision outline overlay (clash detection contact line with bottom shell)
+              ctx.beginPath();
+              activeSegments.forEach((seg, idx) => {
+                const proj = project({ x: seg.x, y: bh.position, z: seg.zBottom });
+                if (idx === 0) ctx.moveTo(proj.x, proj.y);
+                else ctx.lineTo(proj.x, proj.y);
+              });
+              ctx.strokeStyle = '#f59e0b'; // Amber neon clash light
+              ctx.lineWidth = 4.5;
+              ctx.shadowColor = '#ef4444';
+              ctx.shadowBlur = 12 + 4 * Math.sin(Date.now() * 0.01);
+              if (isMoving) {
+                ctx.setLineDash([8, 4]);
+                ctx.lineDashOffset = -(Date.now() * 0.1) % 12;
+              }
+              ctx.stroke();
+            }
+            ctx.restore();
+
+            // Vertical stiffeners at each active station division (spaced every 2 stations)
+            activeSegments.forEach((seg, idx) => {
+              if (idx % 2 === 0) {
+                const projB = project({ x: seg.x, y: bh.position, z: seg.zBottom });
+                const projT = project({ x: seg.x, y: bh.position, z: seg.zTop });
+                ctx.beginPath();
+                ctx.moveTo(projB.x, projB.y);
+                ctx.lineTo(projT.x, projT.y);
+                ctx.strokeStyle = 'rgba(251, 113, 133, 0.35)'; // Rose-400 translucent
+                ctx.lineWidth = 1.0;
+                ctx.stroke();
+              }
+            });
+
+            // Horizontal subdivisions (deck stringers) at 3 vertical levels
+            [0.3, 0.6, 0.9].forEach(fh => {
+              ctx.beginPath();
+              activeSegments.forEach((seg, idx) => {
+                const localH = seg.zTop - seg.zBottom;
+                const zVal = seg.zBottom + localH * fh;
+                const proj = project({ x: seg.x, y: bh.position, z: zVal });
+                if (idx === 0) ctx.moveTo(proj.x, proj.y);
+                else ctx.lineTo(proj.x, proj.y);
+              });
+              ctx.strokeStyle = 'rgba(251, 113, 133, 0.35)';
+              ctx.lineWidth = 1.0;
+              ctx.stroke();
+            });
+
+            // Label
+            const midSeg = activeSegments[Math.floor(activeSegments.length / 2)];
+            const labelPt = project({ x: midSeg.x, y: bh.position, z: midSeg.zTop + 0.3 });
+            ctx.fillStyle = '#fda4af';
+            ctx.font = 'bold 8px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText(`BH-L Y=${bh.position.toFixed(1)}m`, labelPt.x, labelPt.y);
+          }
+        }
+      });
+    }
+
+    // --- Compute and Draw Visual Balance CoG (LCG/VCG) and CoB (LCB/VCB) Markers ---
+    const lcg = parameters.cogLcg !== undefined ? parameters.cogLcg : parameters.length * 0.48;
+    const vcg = parameters.cogVcg !== undefined ? parameters.cogVcg : parameters.depth * 0.58;
+    const lcb = hydrostatics.lcb;
+    const vcb = hydrostatics.vcb;
+
+    const cogProj = project({ x: lcg, y: 0, z: vcg });
+    const cobProj = project({ x: lcb, y: 0, z: vcb });
+
+    // Draw alignment balance line between G (Gravity) and B (Buoyancy) to visualize trim torque
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(cogProj.x, cogProj.y);
+    ctx.lineTo(cobProj.x, cobProj.y);
+    ctx.strokeStyle = '#ec4899'; // Pink dashed balance vector
+    ctx.lineWidth = 1.8;
+    ctx.setLineDash([4, 3]);
+    ctx.stroke();
+
+    // Label the separation distance and trim effect
+    const midX = (cogProj.x + cobProj.x) / 2;
+    const midY = (cogProj.y + cobProj.y) / 2;
+    const lcbDiff = lcb - lcg;
+    ctx.fillStyle = '#f472b6';
+    ctx.font = 'bold 8px monospace';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = '#000000';
+    ctx.shadowBlur = 4;
+    ctx.fillText(`Separation: ${Math.abs(lcbDiff).toFixed(2)}m (${lcbDiff >= 0 ? 'Trim Aft' : 'Trim Fwd'})`, midX, midY - 6);
+    ctx.restore();
+
+    // 1. Draw Center of Buoyancy (CoB) marker
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cobProj.x, cobProj.y, 8, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(6, 182, 212, 0.85)'; // Radiant cyan
+    ctx.shadowColor = '#06b6d4';
+    ctx.shadowBlur = 10;
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Draw cross inside buoyancy circle
+    ctx.beginPath();
+    ctx.moveTo(cobProj.x - 8, cobProj.y);
+    ctx.lineTo(cobProj.x + 8, cobProj.y);
+    ctx.moveTo(cobProj.x, cobProj.y - 8);
+    ctx.lineTo(cobProj.x, cobProj.y + 8);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    ctx.fillStyle = '#22d3ee';
+    ctx.font = 'bold 9px monospace';
+    ctx.textAlign = 'left';
+    ctx.shadowColor = '#000000';
+    ctx.shadowBlur = 4;
+    ctx.fillText(`B (CoB): LCB=${lcb.toFixed(2)}m, VCB=${vcb.toFixed(2)}m`, cobProj.x + 12, cobProj.y + 3);
+    ctx.restore();
+
+    // 2. Draw Center of Gravity (CoG) marker (alternating black/yellow sectors)
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cogProj.x, cogProj.y, 8, 0, Math.PI * 2);
+    ctx.fillStyle = '#fbbf24'; // Amber background
+    ctx.shadowColor = '#f59e0b';
+    ctx.shadowBlur = 10;
+    ctx.fill();
+
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(cogProj.x, cogProj.y);
+      ctx.arc(cogProj.x, cogProj.y, 8, (i * Math.PI) / 2, ((i + 1) * Math.PI) / 2);
+      ctx.closePath();
+      ctx.fillStyle = i % 2 === 0 ? '#fbbf24' : '#1e293b';
+      ctx.fill();
+    }
+
+    ctx.beginPath();
+    ctx.arc(cogProj.x, cogProj.y, 8, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+
+    ctx.fillStyle = '#fef08a';
+    ctx.font = 'bold 9px monospace';
+    ctx.textAlign = 'left';
+    ctx.shadowColor = '#000000';
+    ctx.shadowBlur = 4;
+    ctx.fillText(`G (CoG): LCG=${lcg.toFixed(2)}m, VCG=${vcg.toFixed(2)}m`, cogProj.x + 12, cogProj.y + 3);
+    ctx.restore();
+
+    // --- Draw Real-Time Clash Detection Monitor HUD overlay ---
+    if (parameters.selectedBulkheadId) {
+      const activeBh = (parameters.bulkheads || []).find(b => b.id === parameters.selectedBulkheadId);
+      if (activeBh) {
+        const isMoving = parameters.isMovingBulkhead;
+        const hudX = 15;
+        const hudY = 70; // Position below the camera compass overlays
+        const hudW = 230;
+        const hudH = 105;
+
+        ctx.save();
+        // Glass panel background
+        ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+        ctx.beginPath();
+        ctx.roundRect(hudX, hudY, hudW, hudH, 6);
+        ctx.fill();
+
+        // Border: flashing red/amber if moving, blue if standby
+        ctx.strokeStyle = isMoving ? '#f59e0b' : '#3b82f6';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        // Flashing Warning status indicator
+        const flash = (Date.now() % 1000) > 500;
+        ctx.fillStyle = isMoving ? (flash ? '#ef4444' : '#f59e0b') : '#3b82f6';
+        ctx.beginPath();
+        ctx.arc(hudX + 20, hudY + 22, 5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Title text
+        ctx.fillStyle = '#f8fafc';
+        ctx.font = 'bold 10px sans-serif';
+        ctx.textAlign = 'left';
+        ctx.fillText(isMoving ? 'CLASH DETECTION MONITOR [ACTIVE]' : 'CLASH DETECTION MONITOR [STANDBY]', hudX + 32, hudY + 25);
+
+        // Divider
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(hudX + 12, hudY + 35);
+        ctx.lineTo(hudX + hudW - 12, hudY + 35);
+        ctx.stroke();
+
+        // HUD Body labels
+        ctx.fillStyle = '#94a3b8';
+        ctx.font = '9px monospace';
+        ctx.fillText('TARGET COMPONENT:', hudX + 15, hudY + 50);
+        ctx.fillText('CONTACT TYPE:', hudX + 15, hudY + 64);
+        ctx.fillText('SHELL PENETRATION:', hudX + 15, hudY + 78);
+        ctx.fillText('COLLISION FEEDBACK:', hudX + 15, hudY + 92);
+
+        // HUD Body values
+        ctx.font = 'bold 9px monospace';
+        ctx.fillStyle = '#e2e8f0';
+        ctx.fillText(activeBh.type === 'transverse' ? 'TRANSVERSE BULKHEAD' : 'LONGITUDINAL BULKHEAD', hudX + 125, hudY + 50);
+        ctx.fillText(activeBh.type === 'transverse' ? 'TRANSVERSE STATION' : 'BOTTOM SHELL PLATE', hudX + 125, hudY + 64);
+        
+        ctx.fillStyle = isMoving ? '#ef4444' : '#10b981';
+        ctx.fillText('0.00 mm (SEALED)', hudX + 125, hudY + 78);
+
+        if (isMoving) {
+          ctx.fillStyle = flash ? '#f59e0b' : '#ef4444';
+          ctx.fillText('⚠️ RE-COMPUTING CLASH', hudX + 125, hudY + 92);
+        } else {
+          ctx.fillStyle = '#34d399';
+          ctx.fillText('✅ INTERSECTION MATCHED', hudX + 125, hudY + 92);
+        }
+
+        ctx.restore();
+      }
+    }
 
     // Compass Overlay & Active Users indicators
     ctx.fillStyle = '#94a3b8';
@@ -1024,10 +1846,25 @@ export default function ViewportsContainer({
       ctx.lineTo(mapX(x), height);
       ctx.stroke();
     }
+    // Draw centerline (Plan)
+    const symDev = parameters.symmetryDeviation || 0;
+    const symTol = parameters.symmetryTolerance ?? 15;
+    const isAsymmetric = symDev > symTol;
+    
+    if (isAsymmetric) {
+      ctx.strokeStyle = '#f43f5e'; // Rose
+      ctx.lineWidth = 2.5;
+      ctx.shadowColor = '#f43f5e';
+      ctx.shadowBlur = 12;
+    } else {
+      ctx.strokeStyle = '#1C2029';
+      ctx.lineWidth = 1;
+    }
     ctx.beginPath();
     ctx.moveTo(0, mapY(0));
     ctx.lineTo(width, mapY(0));
     ctx.stroke();
+    ctx.shadowBlur = 0; // reset
 
     // 1. Draw Waterline half-breadth (Cyan)
     ctx.strokeStyle = '#06b6d4';
@@ -1096,6 +1933,195 @@ export default function ViewportsContainer({
       ctx.fillText(h.label, h.x - 20, h.y - 10);
     });
 
+    // --- Render Automatic Visual Overlay of Frame Stations on Hull (Plan View) ---
+    const showFrameOverlay = parameters.showFrameOverlay ?? true;
+    const frameSpacing = parameters.frameSpacing ?? 0.8;
+    const frameAngle = parameters.frameAngle ?? 0;
+    const frameOverlayColor = parameters.frameOverlayColor ?? 'cyan';
+
+    const themeColors = {
+      cyan: '#22d3ee',
+      amber: '#fbbf24',
+      emerald: '#34d399'
+    };
+    const activeHexColor = themeColors[frameOverlayColor as keyof typeof themeColors] || '#22d3ee';
+
+    if (showFrameOverlay) {
+      const totalFrames = Math.floor(parameters.length / frameSpacing);
+      for (let idx = 1; idx <= totalFrames; idx++) {
+        const xVal = idx * frameSpacing;
+        const u = Math.max(0.01, Math.min(0.99, xVal / parameters.length));
+        
+        const bDeck = getDeckHalfBeam(u, parameters.beam, parameters.transomBeamRatio, parameters.fullness);
+        
+        // Tilt shift: the deck level is shifted forward/aft relative to the keel level
+        const deckZ = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+        const keelZ = getKeelHeight(u, parameters.depth);
+        const rad = (frameAngle * Math.PI) / 180;
+        
+        // Deck shift (dx at deck level)
+        const zOffsetDeck = deckZ - (deckZ + keelZ) / 2;
+        const dxDeck = zOffsetDeck * Math.sin(rad);
+        
+        // Keel shift (dx at keel level)
+        const zOffsetKeel = keelZ - (deckZ + keelZ) / 2;
+        const dxKeel = zOffsetKeel * Math.sin(rad);
+
+        ctx.beginPath();
+        // Line from port deck side to centerline keel, to starboard deck side
+        ctx.moveTo(mapX(xVal + dxDeck), mapY(-bDeck));
+        ctx.lineTo(mapX(xVal + dxKeel), mapY(0));
+        ctx.lineTo(mapX(xVal + dxDeck), mapY(bDeck));
+        
+        ctx.strokeStyle = activeHexColor + '60'; // translucent active color
+        ctx.lineWidth = 1.0;
+        ctx.stroke();
+
+        if (idx % 10 === 0) {
+          ctx.fillStyle = activeHexColor;
+          ctx.font = '6.5px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(`FR${idx}`, mapX(xVal + dxDeck), mapY(-bDeck) - 3);
+        }
+      }
+    }
+
+    // Draw dynamic bulkheads in Plan View
+    if (parameters.bulkheads && parameters.bulkheads.length > 0) {
+      parameters.bulkheads.forEach(bh => {
+        const isSelected = parameters.selectedBulkheadId === bh.id;
+        const isMoving = isSelected && parameters.isMovingBulkhead;
+
+        if (bh.type === 'transverse') {
+          const u = Math.max(0, Math.min(1, bh.position / parameters.length));
+          const bDeck = getDeckHalfBeam(u, parameters.beam, parameters.transomBeamRatio, parameters.fullness);
+          
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(mapX(bh.position), mapY(-bDeck));
+          ctx.lineTo(mapX(bh.position), mapY(bDeck));
+          
+          ctx.strokeStyle = isSelected ? '#ef4444' : '#6366f1'; // Glowing red if selected
+          ctx.lineWidth = isSelected ? (isMoving ? 4.0 : 3.0) : 2.0;
+          
+          if (isSelected) {
+            ctx.shadowColor = '#ef4444';
+            ctx.shadowBlur = 8;
+            if (isMoving) {
+              ctx.setLineDash([4, 2]);
+            }
+          }
+          ctx.stroke();
+          
+          ctx.fillStyle = isSelected ? '#ef4444' : '#a5b4fc';
+          ctx.font = 'bold 8px monospace';
+          ctx.fillText(`BH-T${isSelected ? ' [SELECTED]' : ''}`, mapX(bh.position) + 3, mapY(-bDeck) + 10);
+          ctx.restore();
+        } else if (bh.type === 'longitudinal') {
+          // Draw longitudinal bulkhead as a line at yOffset
+          const yOffset = bh.position;
+          const absY = Math.abs(yOffset);
+          
+          // Find the x limits where the half beam of the deck is >= absY
+          let startX = -1;
+          let endX = -1;
+          for (let x = 0; x <= parameters.length; x += 0.2) {
+            const u = x / parameters.length;
+            const bDeck = getDeckHalfBeam(u, parameters.beam, parameters.transomBeamRatio, parameters.fullness);
+            if (bDeck >= absY) {
+              if (startX === -1) startX = x;
+              endX = x;
+            }
+          }
+          if (startX !== -1 && endX !== -1) {
+            ctx.save();
+            ctx.beginPath();
+            ctx.moveTo(mapX(startX), mapY(yOffset));
+            ctx.lineTo(mapX(endX), mapY(yOffset));
+            
+            ctx.strokeStyle = isSelected ? '#ef4444' : '#f43f5e'; // Glowing red if selected
+            ctx.lineWidth = isSelected ? (isMoving ? 3.5 : 2.5) : 1.8;
+            
+            if (isSelected) {
+              ctx.shadowColor = '#ef4444';
+              ctx.shadowBlur = 8;
+              if (isMoving) {
+                ctx.setLineDash([4, 2]);
+              }
+            }
+            ctx.stroke();
+            
+            ctx.fillStyle = isSelected ? '#ef4444' : '#fda4af';
+            ctx.font = 'bold 8px monospace';
+            ctx.fillText(`BH-L${isSelected ? ' [SELECTED]' : ''}`, mapX((startX + endX) / 2), mapY(yOffset) - 4);
+            ctx.restore();
+          }
+        }
+      });
+    }
+
+    // --- Draw Plan View Balance CoG and CoB Markers ---
+    const lcg = parameters.cogLcg !== undefined ? parameters.cogLcg : parameters.length * 0.48;
+    const lcb = hydrostatics.lcb;
+
+    const cogPx = mapX(lcg);
+    const cogPy = mapY(0);
+    const cobPx = mapX(lcb);
+    const cobPy = mapY(0);
+
+    // Draw alignment balance line
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(cogPx, cogPy);
+    ctx.lineTo(cobPx, cobPy);
+    ctx.strokeStyle = '#ec4899';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 2]);
+    ctx.stroke();
+
+    // 1. Draw Buoyancy center
+    ctx.beginPath();
+    ctx.arc(cobPx, cobPy, 6, 0, Math.PI * 2);
+    ctx.fillStyle = '#06b6d4';
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    // draw cross inside B
+    ctx.beginPath();
+    ctx.moveTo(cobPx - 6, cobPy);
+    ctx.lineTo(cobPx + 6, cobPy);
+    ctx.moveTo(cobPx, cobPy - 6);
+    ctx.lineTo(cobPx, cobPy + 6);
+    ctx.stroke();
+
+    // 2. Draw Gravity center
+    ctx.beginPath();
+    ctx.arc(cogPx, cogPy, 6, 0, Math.PI * 2);
+    ctx.fillStyle = '#fbbf24';
+    ctx.fill();
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(cogPx, cogPy);
+      ctx.arc(cogPx, cogPy, 6, (i * Math.PI) / 2, ((i + 1) * Math.PI) / 2);
+      ctx.fillStyle = i % 2 === 0 ? '#fbbf24' : '#1e293b';
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(cogPx, cogPy, 6, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.0;
+    ctx.stroke();
+
+    // Annotations for LCG vs LCB
+    ctx.fillStyle = '#67e8f9';
+    ctx.font = '8px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`LCB=${lcb.toFixed(1)}m`, cobPx, cobPy + 14);
+    ctx.fillStyle = '#fef08a';
+    ctx.fillText(`LCG=${lcg.toFixed(1)}m`, cogPx, cogPy - 10);
+    ctx.restore();
+
     ctx.fillStyle = '#e2e8f0';
     ctx.font = '12px font-sans, system-ui';
     ctx.fillText('PLAN VIEW (WATERLINES / DECK)', 15, 20);
@@ -1127,6 +2153,8 @@ export default function ViewportsContainer({
 
     const mapX = (x: number) => pad + x * scX;
     const mapZ = (z: number) => height - pad - z * scZ;
+
+    const numStations = mesh.length;
 
     // Draw Grid lines
     ctx.strokeStyle = '#1C2029';
@@ -1221,6 +2249,238 @@ export default function ViewportsContainer({
       ctx.fillText(h.label, h.x + 10, h.y + 4);
     });
 
+    // --- Render Automatic Visual Overlay of Frame Stations on Hull (Profile View) ---
+    const showFrameOverlay = parameters.showFrameOverlay ?? true;
+    const frameSpacing = parameters.frameSpacing ?? 0.8;
+    const frameAngle = parameters.frameAngle ?? 0;
+    const frameOverlayColor = parameters.frameOverlayColor ?? 'cyan';
+
+    const themeColors = {
+      cyan: '#22d3ee',
+      amber: '#fbbf24',
+      emerald: '#34d399'
+    };
+    const activeHexColor = themeColors[frameOverlayColor as keyof typeof themeColors] || '#22d3ee';
+
+    if (showFrameOverlay) {
+      const totalFrames = Math.floor(parameters.length / frameSpacing);
+      for (let idx = 1; idx <= totalFrames; idx++) {
+        const xVal = idx * frameSpacing;
+        const u = Math.max(0.01, Math.min(0.99, xVal / parameters.length));
+        
+        const deckZ = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+        const keelZ = getKeelHeight(u, parameters.depth);
+        const rad = (frameAngle * Math.PI) / 180;
+        
+        // Deck shift (dx at deck level)
+        const zOffsetDeck = deckZ - (deckZ + keelZ) / 2;
+        const dxDeck = zOffsetDeck * Math.sin(rad);
+        
+        // Keel shift (dx at keel level)
+        const zOffsetKeel = keelZ - (deckZ + keelZ) / 2;
+        const dxKeel = zOffsetKeel * Math.sin(rad);
+
+        ctx.beginPath();
+        ctx.moveTo(mapX(xVal + dxKeel), mapZ(keelZ));
+        ctx.lineTo(mapX(xVal + dxDeck), mapZ(deckZ));
+        
+        ctx.strokeStyle = activeHexColor + '80'; // translucent active color
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+
+        if (idx % 10 === 0) {
+          ctx.fillStyle = activeHexColor;
+          ctx.font = '6.5px monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(`FR${idx}`, mapX(xVal + dxDeck), mapZ(deckZ) - 4);
+        }
+      }
+    }
+
+    // Draw dynamic bulkheads in Profile View
+    if (parameters.bulkheads && parameters.bulkheads.length > 0) {
+      parameters.bulkheads.forEach(bh => {
+        const isSelected = parameters.selectedBulkheadId === bh.id;
+        const isMoving = isSelected && parameters.isMovingBulkhead;
+
+        if (bh.type === 'transverse') {
+          const u = Math.max(0, Math.min(1, bh.position / parameters.length));
+          const zk = getKeelHeight(u, parameters.depth);
+          const deckZ = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+          
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(mapX(bh.position), mapZ(zk));
+          ctx.lineTo(mapX(bh.position), mapZ(deckZ));
+          
+          ctx.strokeStyle = isSelected ? '#ef4444' : '#6366f1'; // Glowing red if selected
+          ctx.lineWidth = isSelected ? (isMoving ? 4.0 : 3.0) : 2.0;
+          
+          if (isSelected) {
+            ctx.shadowColor = '#ef4444';
+            ctx.shadowBlur = 8;
+            if (isMoving) {
+              ctx.setLineDash([4, 2]);
+            }
+          }
+          ctx.stroke();
+          
+          ctx.fillStyle = isSelected ? '#ef4444' : '#a5b4fc';
+          ctx.font = 'bold 8px monospace';
+          ctx.fillText(`BH-T${isSelected ? ' [SELECTED]' : ''}`, mapX(bh.position) + 3, mapZ(deckZ) + 12);
+          ctx.restore();
+        } else if (bh.type === 'longitudinal') {
+          // Draw longitudinal bulkhead profile from active start to end
+          const absY = Math.abs(bh.position);
+          
+          ctx.beginPath();
+          let started = false;
+          for (let s = 0; s < numStations; s++) {
+            const u = s / (numStations - 1);
+            const x = u * parameters.length;
+            const station = mesh[s];
+            if (!station) continue;
+            
+            const zDeck = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+            const zKeel = getKeelHeight(u, parameters.depth);
+            
+            let zBottom = zKeel;
+            let active = false;
+            
+            let foundIntersect = false;
+            for (let p = 0; p < station.length - 1; p++) {
+              const p1 = station[p];
+              const p2 = station[p + 1];
+              if ((p1.y <= absY && p2.y >= absY) || (p1.y >= absY && p2.y <= absY)) {
+                const frac = (absY - p1.y) / (p2.y - p1.y || 1);
+                zBottom = p1.z + frac * (p2.z - p1.z);
+                foundIntersect = true;
+                break;
+              }
+            }
+            
+            if (foundIntersect) {
+              active = true;
+            } else {
+              const maxHalfB = station[station.length - 1].y;
+              if (absY <= maxHalfB) {
+                zBottom = zKeel;
+                active = true;
+              } else {
+                active = false;
+              }
+            }
+            
+            if (active) {
+              if (!started) {
+                ctx.moveTo(mapX(x), mapZ(zBottom));
+                started = true;
+              } else {
+                ctx.lineTo(mapX(x), mapZ(zBottom));
+              }
+            }
+          }
+          
+          // Now trace deck line back from forward to aft
+          for (let s = numStations - 1; s >= 0; s--) {
+            const u = s / (numStations - 1);
+            const x = u * parameters.length;
+            const station = mesh[s];
+            if (!station) continue;
+            
+            const zDeck = parameters.depth + getSheer(u, parameters.sheerBow, parameters.sheerStern);
+            const maxHalfB = station[station.length - 1].y;
+            if (absY <= maxHalfB) {
+              ctx.lineTo(mapX(x), mapZ(zDeck));
+            }
+          }
+          
+          ctx.closePath();
+          ctx.save();
+          ctx.strokeStyle = isSelected ? '#ef4444' : '#f43f5e'; // Glowing red if selected
+          ctx.lineWidth = isSelected ? (isMoving ? 3.5 : 2.5) : 1.5;
+          ctx.fillStyle = isSelected 
+            ? (isMoving ? 'rgba(239, 68, 68, 0.2)' : 'rgba(239, 68, 68, 0.12)') 
+            : 'rgba(244, 63, 94, 0.08)';
+          
+          if (isSelected) {
+            ctx.shadowColor = '#ef4444';
+            ctx.shadowBlur = 8;
+            if (isMoving) {
+              ctx.setLineDash([4, 2]);
+            }
+          }
+          ctx.fill();
+          ctx.stroke();
+          ctx.restore();
+        }
+      });
+    }
+
+    // --- Draw Profile View Balance CoG and CoB Markers ---
+    const lcg = parameters.cogLcg !== undefined ? parameters.cogLcg : parameters.length * 0.48;
+    const vcg = parameters.cogVcg !== undefined ? parameters.cogVcg : parameters.depth * 0.58;
+    const lcb = hydrostatics.lcb;
+    const vcb = hydrostatics.vcb;
+
+    const cogPx = mapX(lcg);
+    const cogPy = mapZ(vcg);
+    const cobPx = mapX(lcb);
+    const cobPy = mapZ(vcb);
+
+    // Draw alignment balance line
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(cogPx, cogPy);
+    ctx.lineTo(cobPx, cobPy);
+    ctx.strokeStyle = '#ec4899';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 2]);
+    ctx.stroke();
+
+    // 1. Draw Buoyancy center
+    ctx.beginPath();
+    ctx.arc(cobPx, cobPy, 6, 0, Math.PI * 2);
+    ctx.fillStyle = '#06b6d4';
+    ctx.fill();
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+    // draw cross inside B
+    ctx.beginPath();
+    ctx.moveTo(cobPx - 6, cobPy);
+    ctx.lineTo(cobPx + 6, cobPy);
+    ctx.moveTo(cobPx, cobPy - 6);
+    ctx.lineTo(cobPx, cobPy + 6);
+    ctx.stroke();
+
+    // 2. Draw Gravity center
+    ctx.beginPath();
+    ctx.arc(cogPx, cogPy, 6, 0, Math.PI * 2);
+    ctx.fillStyle = '#fbbf24';
+    ctx.fill();
+    for (let i = 0; i < 4; i++) {
+      ctx.beginPath();
+      ctx.moveTo(cogPx, cogPy);
+      ctx.arc(cogPx, cogPy, 6, (i * Math.PI) / 2, ((i + 1) * Math.PI) / 2);
+      ctx.fillStyle = i % 2 === 0 ? '#fbbf24' : '#1e293b';
+      ctx.fill();
+    }
+    ctx.beginPath();
+    ctx.arc(cogPx, cogPy, 6, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.0;
+    ctx.stroke();
+
+    // Annotations for LCG / VCG vs LCB / VCB
+    ctx.fillStyle = '#67e8f9';
+    ctx.font = '8px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`B: LCB=${lcb.toFixed(1)}m, VCB=${vcb.toFixed(1)}m`, cobPx + 10, cobPy + 3);
+    ctx.fillStyle = '#fef08a';
+    ctx.fillText(`G: LCG=${lcg.toFixed(1)}m, VCG=${vcg.toFixed(1)}m`, cogPx + 10, cogPy + 3);
+    ctx.restore();
+
     ctx.fillStyle = '#e2e8f0';
     ctx.font = '12px font-sans, system-ui';
     ctx.fillText('PROFILE VIEW (SIDE / SHEER / KEEL)', 15, 20);
@@ -1251,13 +2511,25 @@ export default function ViewportsContainer({
     const mapY = (y: number) => width / 2 + y * scX;
     const mapZ = (z: number) => height - pad - z * scZ;
 
-    // Draw grid & Centerline
-    ctx.strokeStyle = '#1C2029';
-    ctx.lineWidth = 0.5;
+    // Draw grid & Centerline (Body)
+    const symDev = parameters.symmetryDeviation || 0;
+    const symTol = parameters.symmetryTolerance ?? 15;
+    const isAsymmetric = symDev > symTol;
+
+    if (isAsymmetric) {
+      ctx.strokeStyle = '#f43f5e'; // Rose
+      ctx.lineWidth = 2.5;
+      ctx.shadowColor = '#f43f5e';
+      ctx.shadowBlur = 12;
+    } else {
+      ctx.strokeStyle = '#1C2029';
+      ctx.lineWidth = 1;
+    }
     ctx.beginPath();
     ctx.moveTo(width / 2, 0);
     ctx.lineTo(width / 2, height);
     ctx.stroke();
+    ctx.shadowBlur = 0; // reset
 
     for (let z = 0; z <= parameters.depth * 1.3; z += parameters.depth / 4) {
       ctx.beginPath();
@@ -1467,6 +2739,405 @@ export default function ViewportsContainer({
     setActiveHandle(null);
   };
 
+  const renderMeasurementOverlay = () => {
+    if (!isMeasuringMode) return null;
+
+    let distanceText = "Select PT1 & PT2";
+    let dx = 0, dy = 0, dz = 0;
+    let hasBoth = false;
+
+    if (measuredPoint1 && measuredPoint2) {
+      dx = measuredPoint2.x - measuredPoint1.x;
+      dy = measuredPoint2.y - measuredPoint1.y;
+      dz = measuredPoint2.z - measuredPoint1.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      distanceText = `${dist.toFixed(3)} m`;
+      hasBoth = true;
+    } else if (measuredPoint1) {
+      distanceText = "Select PT2 on hull...";
+    }
+
+    return (
+      <div className="absolute bottom-3 left-3 bg-slate-950/90 backdrop-blur-md p-3 rounded-lg border border-amber-500/30 text-slate-300 shadow-xl max-w-xs font-mono text-xs z-20 space-y-1.5 animate-fadeIn" id="measurement_hud_overlay">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-1 flex-wrap">
+          <span className="text-amber-400 font-bold flex items-center space-x-1">
+            <Ruler className="w-3.5 h-3.5 shrink-0" />
+            <span>3D CALIPER MEASURE</span>
+          </span>
+          <button 
+            onClick={() => {
+              setMeasuredPoint1(null);
+              setMeasuredPoint2(null);
+            }} 
+            className="text-[10px] text-slate-500 hover:text-slate-300 underline"
+          >
+            Reset
+          </button>
+        </div>
+        
+        <div className="space-y-1 text-[11px]">
+          <div className="flex justify-between">
+            <span className="text-slate-500">PT1:</span>
+            <span>
+              {measuredPoint1 
+                ? `[${measuredPoint1.x.toFixed(2)}, ${measuredPoint1.y.toFixed(2)}, ${measuredPoint1.z.toFixed(2)}]` 
+                : "Click mesh..."
+              }
+            </span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-slate-500">PT2:</span>
+            <span>
+              {measuredPoint2 
+                ? `[${measuredPoint2.x.toFixed(2)}, ${measuredPoint2.y.toFixed(2)}, ${measuredPoint2.z.toFixed(2)}]` 
+                : "Click mesh..."
+              }
+            </span>
+          </div>
+          
+          {hasBoth && (
+            <div className="pt-1.5 mt-1 border-t border-slate-900 space-y-0.5 text-[10px] text-slate-400">
+              <div className="flex justify-between">
+                <span>ΔX (Length):</span>
+                <span className="text-slate-200 font-bold">{Math.abs(dx).toFixed(3)} m</span>
+              </div>
+              <div className="flex justify-between">
+                <span>ΔY (Beam Span):</span>
+                <span className="text-slate-200 font-bold">{Math.abs(dy).toFixed(3)} m</span>
+              </div>
+              <div className="flex justify-between">
+                <span>ΔZ (Height/Draft):</span>
+                <span className="text-slate-200 font-bold">{Math.abs(dz).toFixed(3)} m</span>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="pt-2 flex flex-col space-y-1">
+          <div className="text-[10px] text-slate-500">Direct Distance:</div>
+          <div className="text-lg font-bold text-cyan-400 leading-none">
+            {distanceText}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderSlicingGZOverlay = () => {
+    if (visMode !== 'slicing' || slicePlane !== 'X') return null;
+
+    const uCut = slicePosition / 100;
+    const xCoord = uCut * parameters.length;
+
+    // Calculate current heeled state
+    const heelAngleRad = (hudHeelAngle * Math.PI) / 180;
+    const currentStability = computeStationStability(uCut, heelAngleRad, parameters);
+
+    // Calculate full GZ curve for this station
+    const angles = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90];
+    const curvePoints = angles.map(angle => {
+      const rad = (angle * Math.PI) / 180;
+      const stab = computeStationStability(uCut, rad, parameters);
+      return { angle, gz: stab.GZ };
+    });
+
+    const maxGZValue = Math.max(0.2, ...curvePoints.map(p => p.gz));
+
+    // SVG graph params
+    const graphW = 120;
+    const graphH = 95;
+    const padX = 20;
+    const padY = 15;
+
+    const mapAngleX = (a: number) => padX + (a / 90) * (graphW - 2 * padX);
+    const mapGZY = (gz: number) => (graphH - padY) - (gz / maxGZValue) * (graphH - 2 * padY);
+
+    // Generate graph polyline string
+    const polylineStr = curvePoints
+      .map(p => `${mapAngleX(p.angle).toFixed(1)},${mapGZY(p.gz).toFixed(1)}`)
+      .join(' ');
+
+    // Mini 2D cross-section SVG params
+    const sectW = 120;
+    const sectH = 95;
+    const sectCX = sectW / 2;
+    const sectBY = sectH - 15;
+    const sectScale = Math.min(
+      (sectW * 0.45) / Math.max(1, parameters.beam / 2),
+      (sectH * 0.6) / Math.max(1, parameters.depth)
+    );
+
+    // Get unheeled station points to draw contour
+    const points3D = getStationPoints(uCut, parameters, 25);
+    
+    // Waterline level (horizontal blue line in global frame)
+    // To draw in ship local frame, we draw at height draft
+    // And if we rotate ship by heel angle:
+    // Unheeled hull points can be drawn, but it is easier to rotate the ship and keep the water level horizontal!
+    // Let's do that:
+    // Ship center of gravity is G = (0, KG)
+    // For each point, its rotated screen coordinate is:
+    // x = sectCX + ( y_rotated ) * sectScale
+    // y = sectBY - ( z_rotated - zKeel ) * sectScale
+    const getScreenCoord = (y: number, z: number, rotated: boolean) => {
+      let rY = y;
+      let rZ = z;
+      if (rotated) {
+        // Rotate about G = (0, KG) by -heelAngleRad
+        // heeling hull to starboard rotates hull counter-clockwise by heelAngleRad
+        const KG = currentStability.KG;
+        rY = y * Math.cos(-heelAngleRad) - (z - KG) * Math.sin(-heelAngleRad);
+        rZ = KG + y * Math.sin(-heelAngleRad) + (z - KG) * Math.cos(-heelAngleRad);
+      }
+      return {
+        x: sectCX + rY * sectScale,
+        y: sectBY - (rZ - currentStability.zKeel) * sectScale
+      };
+    };
+
+    // Build SVG paths for Starboard and Port halves of the hull
+    // We can merge them into a single closed contour
+    let hullPath = '';
+    if (points3D.length > 0) {
+      // Starboard side (keel to deck)
+      points3D.forEach((pt, idx) => {
+        const sc = getScreenCoord(pt.y, pt.z, true);
+        if (idx === 0) hullPath += `M ${sc.x.toFixed(1)} ${sc.y.toFixed(1)}`;
+        else hullPath += ` L ${sc.x.toFixed(1)} ${sc.y.toFixed(1)}`;
+      });
+      // Port side (deck back to keel)
+      for (let idx = points3D.length - 1; idx >= 0; idx--) {
+        const pt = points3D[idx];
+        const sc = getScreenCoord(-pt.y, pt.z, true);
+        hullPath += ` L ${sc.x.toFixed(1)} ${sc.y.toFixed(1)}`;
+      }
+      hullPath += ' Z';
+    }
+
+    // Centroid of buoyancy B in heeled coordinates
+    const scB = getScreenCoord(currentStability.yB, currentStability.zB, true);
+    // Center of gravity G (which is (0, KG))
+    const scG = getScreenCoord(0, currentStability.KG, true);
+
+    // Screen coordinate for unheeled water level
+    // Horizontal waterline at global Z = draft
+    // In our rotated coordinates, we keep water level flat at global Z = draft
+    // screen Y of water is:
+    const wlYScreen = sectBY - (parameters.draft - currentStability.zKeel) * sectScale;
+
+    return (
+      <div className="absolute bottom-3 right-3 bg-slate-950/90 backdrop-blur-md p-4 rounded-lg border border-purple-500/35 text-slate-300 shadow-2xl w-80 z-20 space-y-3.5 animate-fadeIn" id="slicing_gz_hud_overlay">
+        {/* HUD Header */}
+        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+          <div className="flex items-center space-x-2">
+            <span className="w-2.5 h-2.5 rounded-full bg-purple-500 animate-pulse"></span>
+            <span className="font-bold font-sans text-xs text-purple-300 uppercase tracking-wider">Station Stability (GZ)</span>
+          </div>
+          <span className="font-mono text-[10px] text-slate-500">X = {xCoord.toFixed(1)}m ({slicePosition}%)</span>
+        </div>
+
+        {/* Top visualizer grid (Section Shape vs GZ curve) */}
+        <div className="flex space-x-2.5">
+          {/* Left: 2D Section Schematics */}
+          <div className="flex-1 flex flex-col items-center">
+            <span className="text-[9px] font-bold text-slate-400 font-mono mb-1">CROSS SECTION</span>
+            <div className="bg-slate-900 border border-slate-800 rounded p-1 w-full flex items-center justify-center relative overflow-hidden">
+              <svg width={sectW} height={sectH} className="overflow-visible">
+                <defs>
+                  <marker id="arrow" viewBox="0 0 10 10" refX="5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+                    <path d="M 0 0 L 10 5 L 0 10 z" fill="#10b981" />
+                  </marker>
+                </defs>
+
+                {/* Horizontal flat waterline */}
+                <line 
+                  x1={0} 
+                  y1={wlYScreen} 
+                  x2={sectW} 
+                  y2={wlYScreen} 
+                  stroke="#22d3ee" 
+                  strokeWidth="1.5" 
+                  strokeDasharray="2,2" 
+                />
+                
+                {/* Sea/Submerged glass overlay */}
+                <rect 
+                  x={0} 
+                  y={wlYScreen} 
+                  width={sectW} 
+                  height={Math.max(0, sectH - wlYScreen)} 
+                  fill="rgba(6, 182, 212, 0.08)" 
+                />
+
+                {/* Heeled Hull Contour */}
+                <path 
+                  d={hullPath} 
+                  fill="rgba(168, 85, 247, 0.12)" 
+                  stroke="#a855f7" 
+                  strokeWidth="1.5" 
+                />
+
+                {/* Submerged centroid buoyancy B */}
+                {currentStability.area > 0 && (
+                  <>
+                    {/* Vertical Buoyancy force vector line */}
+                    <line 
+                      x1={scB.x} 
+                      y1={scB.y} 
+                      x2={scB.x} 
+                      y2={Math.max(0, scB.y - 30)} 
+                      stroke="#10b981" 
+                      strokeWidth="1.2" 
+                      markerEnd="url(#arrow)" 
+                    />
+                    <circle cx={scB.x} cy={scB.y} r="3.5" fill="#10b981" stroke="#ffffff" strokeWidth="0.8" />
+                    <text x={scB.x + 5} y={scB.y + 3} fill="#10b981" fontSize="7" fontWeight="bold">B</text>
+                  </>
+                )}
+
+                {/* Center of gravity G */}
+                <circle cx={scG.x} cy={scG.y} r="3.5" fill="#ef4444" stroke="#ffffff" strokeWidth="0.8" />
+                <text x={scG.x - 10} y={scG.y + 3} fill="#ef4444" fontSize="7" fontWeight="bold">G</text>
+
+                {/* GZ Righting Lever Arm visual */}
+                {currentStability.area > 0 && (
+                  <line 
+                    x1={scG.x} 
+                    y1={scG.y} 
+                    x2={scB.x} 
+                    y2={scG.y} 
+                    stroke="#f59e0b" 
+                    strokeWidth="1.8" 
+                    strokeDasharray="3,1" 
+                  />
+                )}
+              </svg>
+            </div>
+          </div>
+
+          {/* Right: GZ Graph */}
+          <div className="flex-1 flex flex-col items-center">
+            <span className="text-[9px] font-bold text-slate-400 font-mono mb-1">LOCAL GZ CURVE (m)</span>
+            <div className="bg-slate-900 border border-slate-800 rounded p-1 w-full flex items-center justify-center">
+              <svg width={graphW} height={graphH} className="overflow-visible">
+                {/* Horizontal reference axis */}
+                <line 
+                  x1={padX} 
+                  y1={graphH - padY} 
+                  x2={graphW - padX} 
+                  y2={graphH - padY} 
+                  stroke="#334155" 
+                  strokeWidth="1" 
+                />
+                <line 
+                  x1={padX} 
+                  y1={padY} 
+                  x2={padX} 
+                  y2={graphH - padY} 
+                  stroke="#334155" 
+                  strokeWidth="1" 
+                />
+
+                {/* Graph Grid ticks */}
+                {[0, 30, 60, 90].map(deg => (
+                  <g key={deg}>
+                    <line 
+                      x1={mapAngleX(deg)} 
+                      y1={padY} 
+                      x2={mapAngleX(deg)} 
+                      y2={graphH - padY} 
+                      stroke="#1e293b" 
+                      strokeWidth="0.5" 
+                    />
+                    <text 
+                      x={mapAngleX(deg)} 
+                      y={graphH - padY + 10} 
+                      fill="#64748b" 
+                      fontSize="7" 
+                      fontFamily="monospace" 
+                      textAnchor="middle"
+                    >
+                      {deg}°
+                    </text>
+                  </g>
+                ))}
+
+                {/* GZ Curve Polyline */}
+                <polyline 
+                  points={polylineStr} 
+                  fill="none" 
+                  stroke="#a855f7" 
+                  strokeWidth="2" 
+                  strokeLinecap="round" 
+                />
+
+                {/* Current angle highlight circle */}
+                {(() => {
+                  const cx = mapAngleX(hudHeelAngle);
+                  const cy = mapGZY(currentStability.GZ);
+                  return (
+                    <circle 
+                      cx={cx} 
+                      cy={cy} 
+                      r="4" 
+                      fill="#f59e0b" 
+                      stroke="#ffffff" 
+                      strokeWidth="1" 
+                      className="animate-pulse" 
+                    />
+                  );
+                })()}
+
+                {/* Vertical slider tracker */}
+                <line 
+                  x1={mapAngleX(hudHeelAngle)} 
+                  y1={padY} 
+                  x2={mapAngleX(hudHeelAngle)} 
+                  y2={graphH - padY} 
+                  stroke="rgba(245, 158, 11, 0.3)" 
+                  strokeWidth="1" 
+                  strokeDasharray="2,2" 
+                />
+              </svg>
+            </div>
+          </div>
+        </div>
+
+        {/* Bottom Interactive Angle Controls */}
+        <div className="space-y-2 pt-1 border-t border-slate-900">
+          <div className="flex justify-between items-center text-[10px] font-mono">
+            <span className="text-slate-400">Section Heel Angle:</span>
+            <span className="text-purple-300 font-bold">{hudHeelAngle}° ({heelAngleRad.toFixed(3)} rad)</span>
+          </div>
+          <div className="flex items-center space-x-2">
+            <input 
+              type="range"
+              min="0"
+              max="90"
+              step="1"
+              value={hudHeelAngle}
+              onChange={(e) => setHudHeelAngle(parseInt(e.target.value))}
+              className="w-full accent-purple-500 cursor-pointer h-1.5 rounded bg-slate-800"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-2 pt-1.5 text-[10px] font-mono">
+            <div className="bg-slate-900/60 p-2 rounded border border-slate-850/50">
+              <span className="text-slate-500 block">LOCAL GZ LEVER:</span>
+              <span className="text-[11px] font-bold text-amber-400">{currentStability.GZ.toFixed(3)} m</span>
+            </div>
+            <div className="bg-slate-900/60 p-2 rounded border border-slate-850/50">
+              <span className="text-slate-500 block">STABILITY STATE:</span>
+              <span className={`text-[11px] font-bold ${currentStability.GZ > 0 ? 'text-emerald-400' : 'text-rose-400 animate-pulse'}`}>
+                {currentStability.GZ > 0 ? '✔️ POSITIVE RIGHTING' : '❌ CAPSIZING MOMENT'}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="flex flex-col h-full bg-slate-900 border border-slate-700 rounded-lg overflow-hidden" id="cad_viewports">
       {/* CAD Toolbar */}
@@ -1570,6 +3241,42 @@ export default function ViewportsContainer({
               <Activity className="w-3.5 h-3.5 text-cyan-400" />
               <span>Stress Heatmap</span>
             </button>
+          </div>
+        </div>
+
+        {/* Measurement Tool Toggle */}
+        <div className="flex items-center space-x-2">
+          <span className="text-[10px] uppercase font-bold tracking-wider text-slate-400 font-mono">Measurement:</span>
+          <div className="flex bg-slate-950 p-0.5 rounded border border-slate-800">
+            <button
+              onClick={() => {
+                setIsMeasuringMode(!isMeasuringMode);
+                if (!isMeasuringMode) {
+                  // Turn off other heavy modes if needed, but keeping simple toggle is fine!
+                } else {
+                  setMeasuredPoint1(null);
+                  setMeasuredPoint2(null);
+                }
+              }}
+              className={`flex items-center space-x-1.5 px-2.5 py-1 rounded transition-all ${isMeasuringMode ? 'bg-amber-950 text-amber-400 font-semibold border border-amber-800/50 animate-pulse' : 'text-slate-400 hover:text-slate-200'}`}
+              title="Click two points on the 3D hull mesh to measure direct distance"
+              id="btn_measuring_mode"
+            >
+              <Ruler className="w-3.5 h-3.5 text-amber-400" />
+              <span>{isMeasuringMode ? 'Measuring Active' : 'Measure 3D'}</span>
+            </button>
+            {(measuredPoint1 || measuredPoint2) && (
+              <button
+                onClick={() => {
+                  setMeasuredPoint1(null);
+                  setMeasuredPoint2(null);
+                }}
+                className="px-2 py-1 text-[10px] text-rose-400 hover:text-rose-300 font-semibold font-mono transition"
+                title="Clear measurement points"
+              >
+                Clear
+              </button>
+            )}
           </div>
         </div>
 
@@ -1764,6 +3471,8 @@ export default function ViewportsContainer({
                 <Compass className="w-3.5 h-3.5 text-cyan-400" />
                 <span>PERSPECTIVE 3D</span>
               </div>
+              {renderMeasurementOverlay()}
+              {renderSlicingGZOverlay()}
             </div>
 
             {/* Plan Viewport */}
@@ -1820,16 +3529,20 @@ export default function ViewportsContainer({
         ) : (
           <div className="h-full w-full relative">
             {activeViewport === '3d' && (
-              <canvas
-                ref={canvas3D}
-                onMouseDown={handleMouseDown3D}
-                onMouseMove={handleMouseMove3D}
-                onMouseUp={handleMouseUp3D}
-                onMouseLeave={handleMouseUp3D}
-                onWheel={handleWheel3D}
-                className="w-full h-full cursor-grab active:cursor-grabbing"
-                id="canvas_3d_solo"
-              />
+              <div className="w-full h-full relative">
+                <canvas
+                  ref={canvas3D}
+                  onMouseDown={handleMouseDown3D}
+                  onMouseMove={handleMouseMove3D}
+                  onMouseUp={handleMouseUp3D}
+                  onMouseLeave={handleMouseUp3D}
+                  onWheel={handleWheel3D}
+                  className="w-full h-full cursor-grab active:cursor-grabbing"
+                  id="canvas_3d_solo"
+                />
+                {renderMeasurementOverlay()}
+                {renderSlicingGZOverlay()}
+              </div>
             )}
             {activeViewport === 'plan' && (
               <canvas
@@ -1869,9 +3582,10 @@ export default function ViewportsContainer({
       </div>
 
       {/* Guide Bar */}
-      <div className="px-4 py-1.5 bg-slate-850 border-t border-slate-700 flex justify-between items-center text-[11px] text-slate-400">
+      <div className="px-4 py-1.5 bg-slate-850 border-t border-slate-700 flex flex-wrap gap-2 justify-between items-center text-[11px] text-slate-400">
         <span>🖱️ Drag left-mouse to rotate 3D, scroll to zoom.</span>
-        <span className="text-amber-500 font-semibold font-mono">● Drag orange dots directly in Plans to reshape the hull.</span>
+        <span className="text-amber-400 font-semibold font-mono">📐 Click "Measure 3D" & click 2 hull points to measure distance!</span>
+        <span className="text-cyan-400 font-semibold font-mono">● Drag orange dots in Plans to reshape hull.</span>
       </div>
     </div>
   );

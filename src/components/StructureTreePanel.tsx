@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { HullParameters } from '../types';
 import { 
   Folder, 
@@ -18,7 +18,13 @@ import {
   ShieldAlert,
   Info,
   Sliders,
-  HardDrive
+  HardDrive,
+  Compass,
+  ShieldCheck,
+  Sparkles,
+  Eye,
+  EyeOff,
+  PlusCircle
 } from 'lucide-react';
 
 interface StructureTreePanelProps {
@@ -34,9 +40,25 @@ const MATERIALS = {
   composite: { name: 'Carbon Fiber / Epoxy', yield: 450, density: 1600, modulus: 135 }
 };
 
+const FRAME_PROFILES = {
+  'T-Profile 300x150': { name: 'Welded T-Profile 300x150x10/12', area: 0.0051, depth: 300, label: 'High Rigidity' },
+  'T-Profile 400x200': { name: 'Welded T-Profile 400x200x12/16', area: 0.0078, depth: 400, label: 'Extreme Rigidity' },
+  'L-Profile 250x90': { name: 'Rolled L-Profile 250x90x10', area: 0.0033, depth: 250, label: 'Medium Rigidity' },
+  'Bulb Flat 200x10': { name: 'HP Bulb Flat 200x10', area: 0.0021, depth: 200, label: 'Standard Marine' },
+  'Flat Bar 150x12': { name: 'Flat Bar 150x12', area: 0.0018, depth: 150, label: 'Light Weight' }
+};
+
 export default function StructureTreePanel({ parameters, onParameterChange }: StructureTreePanelProps) {
-  // Local structural options
-  const [frameSpacing, setFrameSpacing] = useState<number>(0.8); // meters
+  // Local structural options derived from global parameters or defaults
+  const frameSpacing = parameters.frameSpacing ?? 0.8;
+  const frameAngle = parameters.frameAngle ?? 0;
+  const frameProfile = (parameters.frameProfile as keyof typeof FRAME_PROFILES) ?? 'T-Profile 300x150';
+  const frameThickness = parameters.frameThickness ?? 12;
+  const showFrameOverlay = parameters.showFrameOverlay ?? true;
+  const frameOverlayColor = parameters.frameOverlayColor ?? 'cyan';
+
+  const [hoveredFrameIdx, setHoveredFrameIdx] = useState<number | null>(null);
+
   const [bottomPlatingThickness, setBottomPlatingThickness] = useState<number>(16); // mm
   const [sidePlatingThickness, setSidePlatingThickness] = useState<number>(12); // mm
   const [deckPlatingThickness, setDeckPlatingThickness] = useState<number>(10); // mm
@@ -76,13 +98,17 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
     const deckWeight = (deckArea * (deckPlatingThickness / 1000) * material.density) / 1000;
     const platingWeight = bottomWeight + sideWeight + deckWeight;
 
-    // Frames calculation
+    // Frames calculation (accounting for angle/tilt and custom profile area)
     const totalFrames = Math.floor(L / frameSpacing);
-    const frameWeight = (totalFrames * (B + D * 2) * 0.085 * material.density) / 1000; // approximation of web frame volume
+    const angleFactor = 1 / Math.max(0.707, Math.cos((frameAngle * Math.PI) / 180)); // prevent division by zero or excessive weight spikes
+    const profileArea = FRAME_PROFILES[frameProfile]?.area || 0.0051;
+    const thicknessFactor = frameThickness / 12; // relative to a 12mm baseline web plate
+    const frameWeight = (totalFrames * (B + D * 2) * angleFactor * profileArea * thicknessFactor * material.density) / 1000;
 
     // Bulkheads calculation
+    const bhCount = (parameters.bulkheads || []).length;
     const bulkheadArea = B * D * 0.75; // average section area
-    const bulkheadWeight = (bulkheadCount * bulkheadArea * 0.012 * material.density) / 1000;
+    const bulkheadWeight = (bhCount * bulkheadArea * 0.012 * material.density) / 1000;
 
     // Keel & longitudinal girders
     const keelWeight = (L * 1.2 * 0.024 * material.density) / 1000;
@@ -99,7 +125,10 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
     // Structural safety scoring
     // Section modulus required by class rules (I/y_req is proportional to L^2 * B)
     const requiredModulus = Math.pow(L, 2) * B * 0.000018; // rule of thumb
-    const safetyIndex = sectionModulus / Math.max(0.00001, requiredModulus);
+    
+    // Slight angle penalty for excessive framing tilt (cant frames reduce pure vertical girder stiffness slightly)
+    const anglePenalty = Math.max(0.85, 1 - Math.abs(frameAngle) / 300);
+    const safetyIndex = (sectionModulus / Math.max(0.00001, requiredModulus)) * anglePenalty;
 
     return {
       platingWeight,
@@ -113,25 +142,67 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
       totalFrames,
       neutralAxisZ
     };
-  }, [parameters, frameSpacing, bottomPlatingThickness, sidePlatingThickness, deckPlatingThickness, bulkheadCount, selectedMaterial]);
+  }, [parameters, frameSpacing, bottomPlatingThickness, sidePlatingThickness, deckPlatingThickness, selectedMaterial, frameAngle, frameProfile, frameThickness]);
 
-  // Bulkhead locations list
-  const bulkheadsList = useMemo(() => {
-    const list = [];
-    const step = parameters.length / (bulkheadCount + 1);
-    for (let i = 1; i <= bulkheadCount; i++) {
-      const pos = step * i;
-      list.push({
-        id: `bulkhead_${i}`,
-        name: `Watertight Bulkhead #${i}`,
-        position: pos.toFixed(1) + ' m',
-        thickness: '12 mm',
-        status: pos < parameters.length * 0.15 ? 'Collision' : 'Watertight',
-        stress: (140 - Math.abs(pos - parameters.length / 2) * 0.5).toFixed(1) + ' MPa'
+  // Synchronize/initialize bulkheads list inside parameters if not present or empty
+  useEffect(() => {
+    if (!parameters.bulkheads || parameters.bulkheads.length === 0) {
+      const initialBh = [];
+      const count = 5;
+      const step = parameters.length / (count + 1);
+      for (let i = 1; i <= count; i++) {
+        const pos = parseFloat((step * i).toFixed(1));
+        initialBh.push({
+          id: `bh_transverse_${i}_${Math.random().toString(36).substr(2, 6)}`,
+          type: 'transverse' as const,
+          position: pos,
+          thickness: 12,
+          stress: parseFloat((140 - Math.abs(pos - parameters.length / 2) * 0.5).toFixed(1))
+        });
+      }
+      // Add two longitudinal bulkheads
+      initialBh.push({
+        id: `bh_longitudinal_1_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'longitudinal' as const,
+        position: parseFloat((-parameters.beam * 0.2).toFixed(2)),
+        thickness: 12,
+        stress: 72.5
       });
+      initialBh.push({
+        id: `bh_longitudinal_2_${Math.random().toString(36).substr(2, 6)}`,
+        type: 'longitudinal' as const,
+        position: parseFloat((parameters.beam * 0.2).toFixed(2)),
+        thickness: 12,
+        stress: 72.5
+      });
+      onParameterChange?.({ bulkheads: initialBh });
     }
-    return list;
-  }, [parameters.length, bulkheadCount]);
+  }, [parameters.length, parameters.beam]);
+
+  const bulkheadsList = useMemo(() => {
+    return parameters.bulkheads || [];
+  }, [parameters.bulkheads]);
+
+  const transverseBulkheads = useMemo(() => {
+    return bulkheadsList.filter(b => b.type === 'transverse');
+  }, [bulkheadsList]);
+
+  const longitudinalBulkheads = useMemo(() => {
+    return bulkheadsList.filter(b => b.type === 'longitudinal');
+  }, [bulkheadsList]);
+
+  const activeBh = useMemo(() => {
+    return bulkheadsList.find(b => b.id === selectedItem);
+  }, [bulkheadsList, selectedItem]);
+
+  // Sync selected bulkhead to global parameters for clash detection in 3D viewport
+  useEffect(() => {
+    if (selectedItem && (selectedItem.startsWith('bh_') || bulkheadsList.some(b => b.id === selectedItem))) {
+      onParameterChange?.({ selectedBulkheadId: selectedItem });
+    } else {
+      onParameterChange?.({ selectedBulkheadId: undefined });
+    }
+  }, [selectedItem, onParameterChange, bulkheadsList]);
 
   // Handle click in SVG diagram to select item
   const handleSvgClick = (itemId: string) => {
@@ -210,22 +281,55 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
                     className="flex items-center space-x-1 p-1 hover:bg-slate-850 rounded cursor-pointer text-slate-300"
                   >
                     {expandedNodes.bulkheads ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                    <Folder className="w-3.5 h-3.5 text-amber-500 fill-amber-500/10" />
+                    <Folder className="w-3.5 h-3.5 text-indigo-500 fill-indigo-500/10" />
                     <span>Transverse Bulkheads</span>
                   </div>
 
                   {expandedNodes.bulkheads && (
                     <div className="pl-4 border-l border-slate-800 ml-2.5 mt-0.5 space-y-0.5">
-                      {bulkheadsList.map((bh, i) => (
+                      {transverseBulkheads.map((bh, i) => (
                         <div 
                           key={bh.id}
                           onClick={() => setSelectedItem(bh.id)}
-                          className={`flex items-center space-x-2 p-1 rounded cursor-pointer ${selectedItem === bh.id ? 'bg-cyan-500/10 text-cyan-400 font-bold' : 'text-slate-400 hover:text-slate-200'}`}
+                          className={`flex items-center space-x-2 p-1 rounded cursor-pointer ${selectedItem === bh.id ? 'bg-indigo-500/10 text-indigo-400 font-bold' : 'text-slate-400 hover:text-slate-200'}`}
                         >
                           <File className="w-3.5 h-3.5 text-indigo-400" />
-                          <span>{bh.name}</span>
+                          <span>Trans. BH #{i+1} ({bh.position.toFixed(1)}m)</span>
                         </div>
                       ))}
+                      {transverseBulkheads.length === 0 && (
+                        <div className="text-[10px] text-slate-500 pl-5 italic">No transverse bulkheads</div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* Longitudinal Bulkheads Node */}
+                <div>
+                  <div 
+                    onClick={() => toggleExpand('long_bulkheads')}
+                    className="flex items-center space-x-1 p-1 hover:bg-slate-850 rounded cursor-pointer text-slate-300"
+                  >
+                    {expandedNodes.long_bulkheads ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
+                    <Folder className="w-3.5 h-3.5 text-rose-500 fill-rose-500/10" />
+                    <span>Longitudinal Bulkheads</span>
+                  </div>
+
+                  {expandedNodes.long_bulkheads && (
+                    <div className="pl-4 border-l border-slate-800 ml-2.5 mt-0.5 space-y-0.5">
+                      {longitudinalBulkheads.map((bh, i) => (
+                        <div 
+                          key={bh.id}
+                          onClick={() => setSelectedItem(bh.id)}
+                          className={`flex items-center space-x-2 p-1 rounded cursor-pointer ${selectedItem === bh.id ? 'bg-rose-500/10 text-rose-400 font-bold' : 'text-slate-400 hover:text-slate-200'}`}
+                        >
+                          <File className="w-3.5 h-3.5 text-rose-400" />
+                          <span>Long. BH #{i+1} (Y = {bh.position.toFixed(2)}m)</span>
+                        </div>
+                      ))}
+                      {longitudinalBulkheads.length === 0 && (
+                        <div className="text-[10px] text-slate-500 pl-5 italic">No longitudinal bulkheads</div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -386,29 +490,91 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
               })}
 
               {/* Transverse frames (Stiffeners drawn as thin vertical gray lines) */}
-              {Array.from({ length: Math.min(25, structuralMetrics.totalFrames) }).map((_, idx) => {
-                const step = 500 / Math.min(25, structuralMetrics.totalFrames);
-                const xVal = step * idx + step / 2;
+              {showFrameOverlay && Array.from({ length: structuralMetrics.totalFrames }).map((_, idx) => {
+                const frameNumber = idx + 1;
+                const x_meters = frameNumber * frameSpacing;
+                if (x_meters >= parameters.length) return null;
+
+                const xVal = (x_meters / parameters.length) * 500;
+
                 // Exclude bulkhead overlaps
                 const overlapsBulkhead = Array.from({ length: bulkheadCount }).some((_, bIdx) => {
                   const bhX = (500 / (bulkheadCount + 1)) * (bIdx + 1);
-                  return Math.abs(xVal - bhX) < 4;
+                  return Math.abs(xVal - bhX) < 4.5;
                 });
                 if (overlapsBulkhead) return null;
 
-                const yDeck = 40 + (xVal / 500) * 10;
-                const yKeel = 160;
-                const isSelected = selectedItem.startsWith('frames_midship');
+                const t = xVal / 500;
+                // Bezier-based Deck and Keel Y coordinates
+                const yDeck = (1 - t) * (1 - t) * 40 + 2 * (1 - t) * t * 55 + t * t * 20;
+                const yKeel = (1 - t) * (1 - t) * 160 + 2 * (1 - t) * t * 165 + t * t * 145;
+                const yMid = (yDeck + yKeel) / 2;
+                const h = yKeel - yDeck;
+
+                // Angle/tilt calculation
+                const rad = (frameAngle * Math.PI) / 180;
+                const dx = (h / 2) * Math.sin(rad);
+                const dy = (h / 2) * Math.cos(rad);
+
+                const xTop = xVal + dx;
+                const yTop = yMid - dy;
+                const xBottom = xVal - dx;
+                const yBottom = yMid + dy;
+
+                const isSelected = selectedItem.startsWith('frames');
+                const isHovered = hoveredFrameIdx === frameNumber;
+                
+                // Overlay color theme mapping
+                const themeColors = {
+                  cyan: { main: '#22d3ee', faded: 'rgba(34, 211, 238, 0.65)' },
+                  amber: { main: '#fbbf24', faded: 'rgba(251, 191, 36, 0.65)' },
+                  emerald: { main: '#34d399', faded: 'rgba(52, 211, 153, 0.65)' }
+                };
+                const activeColor = themeColors[frameOverlayColor as keyof typeof themeColors] || themeColors.cyan;
+
                 return (
-                  <line 
-                    key={idx}
-                    x1={xVal} 
-                    y1={yDeck + 2} 
-                    x2={xVal} 
-                    y2={yKeel - 1} 
-                    stroke={isSelected ? 'rgba(34, 211, 238, 0.7)' : '#334155'} 
-                    strokeWidth={isSelected ? '1.5' : '0.5'} 
-                  />
+                  <g key={frameNumber}>
+                    <line 
+                      x1={xTop} 
+                      y1={yTop + 1} 
+                      x2={xBottom} 
+                      y2={yBottom - 1} 
+                      stroke={isHovered ? '#f59e0b' : isSelected ? activeColor.main : activeColor.faded} 
+                      strokeWidth={isHovered ? '2.5' : isSelected ? '1.5' : '0.8'} 
+                      className="cursor-pointer transition-all"
+                      onMouseEnter={() => setHoveredFrameIdx(frameNumber)}
+                      onMouseLeave={() => setHoveredFrameIdx(null)}
+                      onClick={() => handleSvgClick('frames_midship')}
+                    />
+                    {isHovered && (
+                      <g style={{ pointerEvents: 'none' }}>
+                        {/* Interactive HUD bubble near the frame midpoint */}
+                        <rect 
+                          x={Math.max(10, Math.min(370, xVal - 60))} 
+                          y={Math.max(10, yMid - 60)} 
+                          width="120" 
+                          height="50" 
+                          rx="4" 
+                          fill="rgba(15, 23, 42, 0.95)" 
+                          stroke="#f59e0b" 
+                          strokeWidth="1" 
+                          filter="drop-shadow(0px 2px 4px rgba(0,0,0,0.5))"
+                        />
+                        <text x={Math.max(16, Math.min(376, xVal - 54))} y={Math.max(10, yMid - 60) + 12} fill="#f59e0b" fontSize="7" fontFamily="monospace" fontWeight="bold">
+                          FRAME ST. #{frameNumber}
+                        </text>
+                        <text x={Math.max(16, Math.min(376, xVal - 54))} y={Math.max(10, yMid - 60) + 21} fill="#e2e8f0" fontSize="6.5" fontFamily="monospace">
+                          POS: {x_meters.toFixed(2)}m (AFT)
+                        </text>
+                        <text x={Math.max(16, Math.min(376, xVal - 54))} y={Math.max(10, yMid - 60) + 30} fill="#94a3b8" fontSize="6" fontFamily="monospace">
+                          TILT: {frameAngle}° / {frameProfile.split(' ')[0]}
+                        </text>
+                        <text x={Math.max(16, Math.min(376, xVal - 54))} y={Math.max(10, yMid - 60) + 39} fill="#34d399" fontSize="6.5" fontFamily="monospace">
+                          SPAN: {((h / 120) * parameters.depth).toFixed(2)}m
+                        </text>
+                      </g>
+                    )}
+                  </g>
                 );
               })}
 
@@ -543,15 +709,107 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
               </>
             )}
 
-            {selectedItem.startsWith('bulkhead_') && (
+            {activeBh && (
               <>
-                <div className="text-cyan-400 font-bold border-b border-slate-800 pb-1.5 uppercase">{bulkheadsList.find(b => b.id === selectedItem)?.name || 'Bulkhead'}</div>
-                <div className="flex justify-between"><span>Position:</span><span className="text-white">{bulkheadsList.find(b => b.id === selectedItem)?.position}</span></div>
-                <div className="flex justify-between"><span>Thickness:</span><span className="text-white">12 mm</span></div>
-                <div className="flex justify-between"><span>Function:</span><span className="text-indigo-400 font-semibold">{bulkheadsList.find(b => b.id === selectedItem)?.status}</span></div>
-                <div className="flex justify-between"><span>Local Stress:</span><span className="text-slate-300">{bulkheadsList.find(b => b.id === selectedItem)?.stress}</span></div>
-                <div className="flex justify-between"><span>Safety Factor:</span><span className="text-emerald-400 font-bold">2.88x (Safe)</span></div>
-                <div className="text-[10px] text-slate-500 italic mt-2">Transverse watertight dividing plate. Confers extreme torsional stiffness to the hull structure and divides flooding zones.</div>
+                <div className="text-cyan-400 font-bold border-b border-slate-800 pb-1.5 uppercase flex justify-between items-center">
+                  <span>{activeBh.type === 'transverse' ? 'Transverse BH' : 'Longitudinal BH'}</span>
+                  <span className="text-[10px] text-slate-500">ID: {activeBh.id.substring(3, 10)}</span>
+                </div>
+                <div className="flex justify-between"><span>Type:</span><span className="text-white font-bold capitalize">{activeBh.type}</span></div>
+                <div className="flex justify-between">
+                  <span>Position:</span>
+                  <span className="text-white font-bold">
+                    {activeBh.type === 'transverse' ? `${activeBh.position.toFixed(1)} m` : `Y = ${activeBh.position.toFixed(2)} m`}
+                  </span>
+                </div>
+                <div className="flex justify-between"><span>Thickness:</span><span className="text-white font-bold">{activeBh.thickness} mm</span></div>
+                <div className="flex justify-between">
+                  <span>Function:</span>
+                  <span className={activeBh.type === 'transverse' && activeBh.position < parameters.length * 0.15 ? 'text-rose-400 font-semibold' : 'text-emerald-400 font-semibold'}>
+                    {activeBh.type === 'transverse' && activeBh.position < parameters.length * 0.15 ? 'Collision' : 'Watertight'}
+                  </span>
+                </div>
+                <div className="flex justify-between"><span>Local Stress:</span><span className="text-amber-400 font-bold">{(activeBh.stress || 85).toFixed(1)} MPa</span></div>
+                <div className="flex justify-between"><span>Safety Factor:</span><span className="text-emerald-400 font-bold">{(250 / (activeBh.stress || 85)).toFixed(2)}x (Safe)</span></div>
+                
+                {/* Sliders specifically inside Inspector for selected item! */}
+                <div className="border-t border-slate-800 pt-3 mt-3 space-y-3 font-sans">
+                  <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wider">Configure Bulkhead</div>
+                  
+                  <div>
+                    <div className="flex justify-between text-xs mb-1 font-mono">
+                      <span className="text-slate-400">Position</span>
+                      <span className="text-cyan-400 font-bold">
+                        {activeBh.type === 'transverse' ? `${activeBh.position.toFixed(1)} m` : `${activeBh.position.toFixed(2)} m`}
+                      </span>
+                    </div>
+                    <input 
+                      type="range"
+                      min={activeBh.type === 'transverse' ? "0" : (-parameters.beam / 2).toFixed(2)}
+                      max={activeBh.type === 'transverse' ? parameters.length.toFixed(1) : (parameters.beam / 2).toFixed(2)}
+                      step={activeBh.type === 'transverse' ? "0.1" : "0.05"}
+                      value={activeBh.position}
+                      onChange={(e) => {
+                        const newPos = parseFloat(e.target.value);
+                        const updated = (parameters.bulkheads || []).map(b => 
+                          b.id === activeBh.id ? { 
+                            ...b, 
+                            position: newPos,
+                            // Dynamic stress calculation based on position
+                            stress: b.type === 'transverse' 
+                              ? parseFloat((140 - Math.abs(newPos - parameters.length / 2) * 0.5).toFixed(1))
+                              : parseFloat((95 - Math.abs(newPos) * 5.0).toFixed(1))
+                          } : b
+                        );
+                        onParameterChange?.({ 
+                          bulkheads: updated,
+                          isMovingBulkhead: true
+                        });
+                      }}
+                      onMouseUp={() => onParameterChange?.({ isMovingBulkhead: false })}
+                      onTouchEnd={() => onParameterChange?.({ isMovingBulkhead: false })}
+                      className="w-full accent-cyan-500 bg-slate-800 rounded-lg appearance-none h-1.5 cursor-pointer"
+                    />
+                  </div>
+
+                  <div>
+                    <div className="flex justify-between text-xs mb-1 font-mono">
+                      <span className="text-slate-400">Thickness</span>
+                      <span className="text-cyan-400 font-bold">{activeBh.thickness} mm</span>
+                    </div>
+                    <input 
+                      type="range"
+                      min="6"
+                      max="30"
+                      step="1"
+                      value={activeBh.thickness}
+                      onChange={(e) => {
+                        const newTh = parseInt(e.target.value);
+                        const updated = (parameters.bulkheads || []).map(b => 
+                          b.id === activeBh.id ? { ...b, thickness: newTh } : b
+                        );
+                        onParameterChange?.({ 
+                          bulkheads: updated,
+                          isMovingBulkhead: true
+                        });
+                      }}
+                      onMouseUp={() => onParameterChange?.({ isMovingBulkhead: false })}
+                      onTouchEnd={() => onParameterChange?.({ isMovingBulkhead: false })}
+                      className="w-full accent-cyan-500 bg-slate-800 rounded-lg appearance-none h-1.5 cursor-pointer"
+                    />
+                  </div>
+
+                  <button
+                    onClick={() => {
+                      const updated = (parameters.bulkheads || []).filter(b => b.id !== activeBh.id);
+                      onParameterChange?.({ bulkheads: updated });
+                      setSelectedItem('root');
+                    }}
+                    className="w-full mt-2 py-1.5 bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/20 rounded-lg font-bold text-xs transition-colors flex items-center justify-center space-x-1.5 font-sans"
+                  >
+                    <span>🗑️ Delete Bulkhead</span>
+                  </button>
+                </div>
               </>
             )}
 
@@ -560,9 +818,11 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
                 <div className="text-cyan-400 font-bold border-b border-slate-800 pb-1.5 uppercase">Transverse Web Frames</div>
                 <div className="flex justify-between"><span>Spacing:</span><span className="text-white font-bold">{frameSpacing} m</span></div>
                 <div className="flex justify-between"><span>Total Frames:</span><span className="text-white font-bold">{structuralMetrics.totalFrames}</span></div>
-                <div className="flex justify-between"><span>Web Depth:</span><span className="text-slate-300">450 mm</span></div>
+                <div className="flex justify-between"><span>Web Profile:</span><span className="text-white font-bold">{frameProfile}</span></div>
+                <div className="flex justify-between"><span>Web Thickness:</span><span className="text-white">{frameThickness} mm</span></div>
+                <div className="flex justify-between"><span>Orientation Angle:</span><span className={`font-bold ${Math.abs(frameAngle) > 0 ? 'text-amber-400' : 'text-slate-300'}`}>{frameAngle}° {frameAngle === 0 ? '(Perpendicular)' : frameAngle > 0 ? '(Cant Forward)' : '(Cant Aft)'}</span></div>
                 <div className="flex justify-between"><span>Estimated Weight:</span><span className="text-emerald-400 font-bold">{structuralMetrics.frameWeight.toFixed(1)} t</span></div>
-                <div className="flex justify-between"><span>Safety Factor:</span><span className="text-emerald-400 font-bold">2.68x (Safe)</span></div>
+                <div className="flex justify-between"><span>Safety Factor:</span><span className="text-emerald-400 font-bold">{(2.68 * (frameThickness / 12) * (Math.max(0.75, 1 - Math.abs(frameAngle)/150))).toFixed(2)}x (Safe)</span></div>
                 <div className="text-[10px] text-slate-500 italic mt-2">Ring frame stiffeners distributed transversely to support the shell plate panels and resist crushing pressures.</div>
               </>
             )}
@@ -635,22 +895,131 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
               </select>
             </div>
 
-            {/* Frame Spacing slider */}
-            <div className="space-y-1 bg-slate-950 p-3 rounded-lg border border-slate-850">
-              <div className="flex justify-between">
-                <span className="text-[11px] text-slate-400 font-bold">FRAME SPACING</span>
-                <span className="text-cyan-400 font-bold">{frameSpacing.toFixed(2)} m</span>
+            {/* Structural Framing Editor Section */}
+            <div className="bg-slate-950 p-3 rounded-lg border border-cyan-900/30 space-y-3.5" id="structural_framing_editor">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                <span className="text-[11px] text-cyan-400 font-bold uppercase tracking-wide flex items-center space-x-1">
+                  <Compass className="w-3.5 h-3.5" />
+                  <span>Structural Framing</span>
+                </span>
+                <span className="text-[9px] font-mono text-slate-500">STATIONS</span>
               </div>
-              <input
-                type="range"
-                min="0.5"
-                max="1.5"
-                step="0.05"
-                value={frameSpacing}
-                onChange={(e) => setFrameSpacing(Number(e.target.value))}
-                className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
-              />
-              <span className="text-[9px] text-slate-500 italic block">Rule range: 0.50m - 1.50m. Smaller spacing increases web weight but reduces buckling.</span>
+
+              {/* Frame Spacing slider */}
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-[10px] text-slate-400">FRAME SPACING</span>
+                  <span className="text-cyan-400 font-bold">{frameSpacing.toFixed(2)} m</span>
+                </div>
+                <input
+                  type="range"
+                  min="0.4"
+                  max="1.8"
+                  step="0.05"
+                  value={frameSpacing}
+                  onChange={(e) => onParameterChange?.({ frameSpacing: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
+                />
+                <span className="text-[8px] text-slate-500 block italic leading-none">
+                  Recommended range: 0.50m - 1.50m.
+                </span>
+              </div>
+
+              {/* Frame Orientation Angle slider */}
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-[10px] text-slate-400">ORIENTATION ANGLE</span>
+                  <span className={`font-bold ${frameAngle === 0 ? 'text-emerald-400' : 'text-amber-400'}`}>{frameAngle}°</span>
+                </div>
+                <input
+                  type="range"
+                  min="-45"
+                  max="45"
+                  step="5"
+                  value={frameAngle}
+                  onChange={(e) => onParameterChange?.({ frameAngle: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
+                />
+                <div className="flex justify-between text-[8px] text-slate-500">
+                  <span>Cant Aft (-45°)</span>
+                  <span>Perp (0°)</span>
+                  <span>Cant Fwd (45°)</span>
+                </div>
+              </div>
+
+              {/* Frame Profile Dropdown */}
+              <div className="space-y-1">
+                <span className="text-[10px] text-slate-400 block uppercase">Frame Web Profile</span>
+                <select
+                  value={frameProfile}
+                  onChange={(e) => onParameterChange?.({ frameProfile: e.target.value })}
+                  className="w-full bg-slate-900 border border-slate-800 rounded p-1 text-[11px] text-cyan-400 font-mono outline-none"
+                >
+                  {Object.entries(FRAME_PROFILES).map(([key, prof]) => (
+                    <option key={key} value={key}>
+                      {key} ({prof.label})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Frame Thickness slider */}
+              <div className="space-y-1">
+                <div className="flex justify-between">
+                  <span className="text-[10px] text-slate-400">WEB THICKNESS</span>
+                  <span className="text-cyan-400 font-bold">{frameThickness} mm</span>
+                </div>
+                <input
+                  type="range"
+                  min="6"
+                  max="30"
+                  step="1"
+                  value={frameThickness}
+                  onChange={(e) => onParameterChange?.({ frameThickness: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
+                />
+              </div>
+
+              {/* Visual Overlay settings */}
+              <div className="flex items-center justify-between border-t border-slate-900 pt-2 text-[10px]">
+                <span className="text-slate-400 flex items-center space-x-1">
+                  {showFrameOverlay ? <Eye className="w-3.5 h-3.5 text-cyan-400" /> : <EyeOff className="w-3.5 h-3.5 text-slate-500" />}
+                  <span>Hull Overlay Visuals</span>
+                </span>
+                <div className="flex items-center space-x-1.5">
+                  <input
+                    type="checkbox"
+                    checked={showFrameOverlay}
+                    onChange={(e) => onParameterChange?.({ showFrameOverlay: e.target.checked })}
+                    className="w-3.5 h-3.5 accent-cyan-500 rounded cursor-pointer"
+                  />
+                  {showFrameOverlay && (
+                    <select
+                      value={frameOverlayColor}
+                      onChange={(e) => onParameterChange?.({ frameOverlayColor: e.target.value })}
+                      className="bg-slate-900 text-cyan-400 border border-slate-800 rounded px-1 text-[9px]"
+                    >
+                      <option value="cyan">Cyan</option>
+                      <option value="amber">Amber</option>
+                      <option value="emerald">Green</option>
+                    </select>
+                  )}
+                </div>
+              </div>
+
+              {/* Angle/Spacing Warning alerts */}
+              {Math.abs(frameAngle) > 20 && (
+                <div className="p-1.5 bg-amber-500/10 border border-amber-500/20 rounded text-[9px] text-amber-300 flex items-start space-x-1 leading-normal">
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                  <span>Cant frames exceed 20° tilt. This requires specialized diagonal bracket connections at the keel to counter shear strain.</span>
+                </div>
+              )}
+              {frameSpacing > 1.4 && (
+                <div className="p-1.5 bg-rose-500/10 border border-rose-500/20 rounded text-[9px] text-rose-300 flex items-start space-x-1 leading-normal">
+                  <ShieldAlert className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+                  <span>Wide frame spacing ({frameSpacing}m) increases shell buckling risk under high seas. Recommend thickness increase.</span>
+                </div>
+              )}
             </div>
 
             {/* Bottom Plating slider */}
@@ -704,21 +1073,61 @@ export default function StructureTreePanel({ parameters, onParameterChange }: St
               />
             </div>
 
-            {/* Bulkhead count */}
-            <div className="space-y-1 bg-slate-950 p-3 rounded-lg border border-slate-850">
-              <div className="flex justify-between">
-                <span className="text-[11px] text-slate-400 font-bold">WATERTIGHT BULKHEADS</span>
-                <span className="text-cyan-400 font-bold">{bulkheadCount}</span>
+            {/* Dynamic Bulkheads Builder Section */}
+            <div className="bg-slate-950 p-3 rounded-lg border border-indigo-900/30 space-y-3.5" id="bulkhead_builder_settings">
+              <div className="flex items-center justify-between border-b border-slate-800 pb-1.5">
+                <span className="text-[11px] text-indigo-400 font-bold uppercase tracking-wide flex items-center space-x-1">
+                  <PlusCircle className="w-3.5 h-3.5" />
+                  <span>Bulkhead CAD Builder</span>
+                </span>
+                <span className="text-[9px] font-mono text-slate-500">DYNAMIC</span>
               </div>
-              <input
-                type="range"
-                min="3"
-                max="12"
-                step="1"
-                value={bulkheadCount}
-                onChange={(e) => setBulkheadCount(Number(e.target.value))}
-                className="w-full accent-cyan-500 cursor-pointer h-1 rounded bg-slate-800"
-              />
+
+              <div className="grid grid-cols-2 gap-2 font-sans">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const newId = `bh_transverse_${Date.now()}`;
+                    const defaultPos = parseFloat((parameters.length * 0.5).toFixed(1));
+                    const newBh = {
+                      id: newId,
+                      type: 'transverse' as const,
+                      position: defaultPos,
+                      thickness: 12,
+                      stress: 85.0
+                    };
+                    const updated = [...(parameters.bulkheads || []), newBh];
+                    onParameterChange?.({ bulkheads: updated });
+                    setSelectedItem(newId);
+                  }}
+                  className="py-1.5 px-2 bg-indigo-600/25 hover:bg-indigo-600/40 text-indigo-300 border border-indigo-500/20 font-bold text-[10px] rounded transition-colors flex items-center justify-center space-x-1"
+                >
+                  <span>➕ Transverse BH</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const newId = `bh_longitudinal_${Date.now()}`;
+                    const newBh = {
+                      id: newId,
+                      type: 'longitudinal' as const,
+                      position: 0.0,
+                      thickness: 12,
+                      stress: 60.0
+                    };
+                    const updated = [...(parameters.bulkheads || []), newBh];
+                    onParameterChange?.({ bulkheads: updated });
+                    setSelectedItem(newId);
+                  }}
+                  className="py-1.5 px-2 bg-rose-600/25 hover:bg-rose-600/40 text-rose-300 border border-rose-500/20 font-bold text-[10px] rounded transition-colors flex items-center justify-center space-x-1"
+                >
+                  <span>➕ Longitudinal BH</span>
+                </button>
+              </div>
+
+              <div className="text-[9px] text-slate-500 italic leading-snug">
+                Add transverse or longitudinal dividing plates. Click any bulkhead item in the assembly tree above to configure its spacing, thickness or delete it.
+              </div>
             </div>
           </div>
         </div>

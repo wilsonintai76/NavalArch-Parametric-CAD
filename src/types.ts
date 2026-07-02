@@ -3,6 +3,14 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+export interface BulkheadConfig {
+  id: string;
+  type: 'longitudinal' | 'transverse';
+  position: number; // distance from stern for transverse, or offset from centerline for longitudinal
+  thickness: number; // in mm, e.g. 12
+  stress?: number; // peak stress in MPa
+}
+
 export interface HullParameters {
   length: number;          // Length Waterline (m)
   beam: number;            // Max Beam (m)
@@ -29,6 +37,24 @@ export interface HullParameters {
   // CFD Simulation parameters
   cfdDetail?: 'low' | 'medium' | 'high';
   cfdSpeedKnots?: number;
+  // Symmetry Check calibration properties
+  symmetryDeviation?: number; // Simulated max deviation (mm)
+  symmetryTolerance?: number; // Selected manufacturing tolerance threshold (mm)
+  // Dynamic Bulkheads configurable via StructureTreePanel and rendered in 3D Viewport
+  bulkheads?: BulkheadConfig[];
+  // Custom gravity center overrides
+  cogLcg?: number;         // Custom Longitudinal Center of Gravity (m from stern)
+  cogVcg?: number;         // Custom Vertical Center of Gravity (m above keel)
+  // Structural Framing properties
+  frameSpacing?: number;      // Transverse frame spacing (m)
+  frameAngle?: number;        // Transverse frame orientation/angle (degrees)
+  frameProfile?: string;      // Transverse frame profile name
+  frameThickness?: number;    // Transverse frame web thickness (mm)
+  showFrameOverlay?: boolean; // Show frame stations visual overlay
+  frameOverlayColor?: string; // Color of the visual overlay
+  // Selected state for bulkheads (Clash Detection)
+  selectedBulkheadId?: string;
+  isMovingBulkhead?: boolean;
 }
 
 export interface Hydrostatics {

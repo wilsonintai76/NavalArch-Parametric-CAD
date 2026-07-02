@@ -160,6 +160,47 @@ function estimateStructure(
   };
 }
 
+const getFieldViolation = (key: string, params: HullParameters): { isCritical: boolean; message: string } | null => {
+  if (key === 'draft') {
+    if (params.draft >= params.depth) {
+      return { isCritical: true, message: 'CRITICAL FEASIBILITY EXCEEDED: Draft exceeds or meets hull depth! The deck will be completely flooded, leading to immediate progressive flooding and catastrophic sinking.' };
+    }
+    if (params.draft >= params.depth - 0.4) {
+      return { isCritical: false, message: 'MARGINAL SAFETY WARNING: Freeboard is extremely low (<0.4m). Low freeboard dramatically increases deck wetness and downflooding risks in high sea states.' };
+    }
+  }
+  if (key === 'depth') {
+    if (params.depth <= params.draft) {
+      return { isCritical: true, message: 'CRITICAL FEASIBILITY EXCEEDED: Depth is less than or equal to draft! Negative freeboard means the vessel has no reserve buoyancy.' };
+    }
+    if (params.depth < params.draft + 0.4) {
+      return { isCritical: false, message: 'MARGINAL SAFETY WARNING: Depth provides insufficient freeboard over draft. Increase depth to prevent structural deck flooding.' };
+    }
+  }
+  if (key === 'bilgeRadius') {
+    const maxBilge = Math.min(params.beam / 2, params.depth) - 0.1;
+    if (params.bilgeRadius > maxBilge) {
+      return { isCritical: true, message: `CRITICAL GEOMETRY EXCEEDED: Bilge radius (${params.bilgeRadius.toFixed(2)}m) exceeds maximum physical bounds (max ${maxBilge.toFixed(2)}m based on beam/2 and depth). Geometry degenerates.` };
+    }
+  }
+  if (key === 'deadrise') {
+    if (params.deadrise > 22 && params.bilgeRadius > 2.5) {
+      return { isCritical: false, message: 'HYDRODYNAMIC WARNING: High deadrise angle (>22°) combined with large bilge radius (>2.5m) creates an overly rounded bottom shape with poor roll damping.' };
+    }
+  }
+  if (key === 'beam') {
+    if (params.beam < params.draft * 1.5) {
+      return { isCritical: false, message: 'TRANSVERSE METACENTRIC RISK: Extremely narrow beam relative to draft (B/T < 1.5) severely limits transverse inertia, producing dangerously low initial GM stability.' };
+    }
+  }
+  if (key === 'flare') {
+    if (params.flare > 25 && params.beam > 25) {
+      return { isCritical: false, message: 'STRUCTURAL FLARE WARNING: Over-flared side shells at high overall beam generate excessive slamming impact forces and huge localized stress concentrations in head seas.' };
+    }
+  }
+  return null;
+};
+
 interface ParamsPanelProps {
   parameters: HullParameters;
   onParameterChange: (params: Partial<HullParameters>) => void;
@@ -181,6 +222,28 @@ export default function ParamsPanel({
   const [customThicknessMm, setCustomThicknessMm] = useState<number>(8);
   const [overheadFactor, setOverheadFactor] = useState<number>(1.45);
   const [isCalcExpanded, setIsCalcExpanded] = useState<boolean>(true);
+
+  // Symmetry and tolerance check states
+  const [isSymmetryExpanded, setIsSymmetryExpanded] = useState<boolean>(true);
+  const [toleranceMm, setToleranceMm] = useState<number>(15);
+  const [simulatedAsymmetryMm, setSimulatedAsymmetryMm] = useState<number>(8);
+  const [isChecking, setIsChecking] = useState<boolean>(false);
+  const [hasChecked, setHasChecked] = useState<boolean>(true);
+
+  const handleRunSymmetryCheck = () => {
+    setIsChecking(true);
+    setTimeout(() => {
+      setIsChecking(false);
+      setHasChecked(true);
+    }, 600);
+  };
+
+  useEffect(() => {
+    onParameterChange({
+      symmetryDeviation: simulatedAsymmetryMm,
+      symmetryTolerance: toleranceMm
+    });
+  }, []);
 
   // Synchronize custom thickness manually when material changes
   useEffect(() => {
@@ -343,18 +406,61 @@ export default function ParamsPanel({
                 const val = rawVal !== undefined ? rawVal : 0;
                 const isFieldLocked = fld.lockedBy && !isReadOnly;
 
+                // Validate parameter feasibility
+                const violation = getFieldViolation(fld.key, parameters);
+                const hasViolation = !!violation;
+                const isCritical = violation?.isCritical;
+
+                const textHighlightClass = hasViolation
+                  ? isCritical
+                    ? 'text-rose-400 font-semibold'
+                    : 'text-amber-400 font-semibold'
+                  : 'text-slate-300';
+
+                const valHighlightClass = hasViolation
+                  ? isCritical
+                    ? 'text-rose-400 font-bold bg-rose-950/40 border-rose-850'
+                    : 'text-amber-400 font-bold bg-amber-950/40 border-amber-850'
+                  : 'text-slate-400 font-bold bg-slate-900 border-slate-800';
+
+                const sliderAccentClass = hasViolation
+                  ? isCritical
+                    ? 'accent-rose-500'
+                    : 'accent-amber-500'
+                  : 'accent-cyan-500';
+
+                const borderHighlightClass = hasViolation
+                  ? isCritical
+                    ? 'border-rose-900/30 bg-rose-950/5'
+                    : 'border-amber-900/20 bg-amber-950/5'
+                  : 'border-transparent';
+
                 return (
-                  <div key={fld.key} className="space-y-1.5">
+                  <div key={fld.key} className={`space-y-1.5 p-2 rounded-lg border transition-all duration-200 ${borderHighlightClass}`}>
                     <div className="flex justify-between items-center text-xs font-mono">
-                      <span className="text-slate-300 flex items-center space-x-1">
+                      <span className={`${textHighlightClass} flex items-center space-x-1.5`}>
                         <span>{fld.label}</span>
                         {isFieldLocked && (
                           <span className="text-[8px] uppercase px-1 py-0.2 bg-red-500/20 text-red-400 border border-red-500/10 rounded">
                             Locked by {fld.lockedBy}
                           </span>
                         )}
+                        {violation && (
+                          <div className="relative group flex items-center z-20">
+                            <AlertCircle className={`w-3.5 h-3.5 ${isCritical ? 'text-rose-500' : 'text-amber-500'} cursor-help animate-pulse`} id={`warn_icon_${fld.key}`} />
+                            <div className="absolute bottom-full left-0 mb-2 hidden group-hover:block w-72 bg-slate-950 text-slate-200 text-[10px] p-2.5 rounded-md shadow-2xl border border-slate-800 leading-normal pointer-events-none font-sans">
+                              <div className="flex items-center space-x-1.5 mb-1.5">
+                                <ShieldAlert className={`w-3.5 h-3.5 ${isCritical ? 'text-rose-500' : 'text-amber-500'}`} />
+                                <span className={`font-bold uppercase tracking-wider ${isCritical ? 'text-rose-400' : 'text-amber-400'}`}>
+                                  {isCritical ? 'Critical Feasibility Alert' : 'Feasibility Warning'}
+                                </span>
+                              </div>
+                              <p className="text-slate-300 font-mono leading-relaxed">{violation.message}</p>
+                            </div>
+                          </div>
+                        )}
                       </span>
-                      <span className="text-slate-400 font-bold bg-slate-900 px-1.5 py-0.5 rounded border border-slate-800">
+                      <span className={`px-1.5 py-0.5 rounded border ${valHighlightClass}`}>
                         {val.toFixed(2)}{fld.unit}
                       </span>
                     </div>
@@ -376,7 +482,7 @@ export default function ParamsPanel({
                         value={val}
                         disabled={isReadOnly || isFieldLocked}
                         onChange={(e) => handleChange(fld.key as any, parseFloat(e.target.value))}
-                        className="flex-1 accent-cyan-500 cursor-ew-resize disabled:opacity-40"
+                        className={`flex-1 cursor-ew-resize disabled:opacity-40 ${sliderAccentClass}`}
                         id={`slider_param_${fld.key}`}
                       />
 
@@ -388,6 +494,18 @@ export default function ParamsPanel({
                         +
                       </button>
                     </div>
+
+                    {/* Inline real-time feasibility error message */}
+                    {violation && (
+                      <div className={`text-[10px] p-2 rounded border mt-1.5 font-mono leading-normal flex items-start space-x-1.5 ${
+                        isCritical 
+                          ? 'bg-rose-950/20 text-rose-400 border-rose-900/30' 
+                          : 'bg-amber-950/20 text-amber-400 border-amber-900/20'
+                      }`} id={`error_msg_${fld.key}`}>
+                        <ShieldAlert className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                        <span>{violation.message}</span>
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -588,6 +706,171 @@ export default function ParamsPanel({
                 </div>
               </div>
             </div>
+          </div>
+        )}
+      </div>
+
+      {/* Symmetry & Manufacturing Tolerance Check Section */}
+      <div className="border-t border-slate-800 pt-5 mt-5" id="symmetry_check_section">
+        <button
+          onClick={() => setIsSymmetryExpanded(!isSymmetryExpanded)}
+          className="w-full flex items-center justify-between py-1 text-xs font-bold font-mono uppercase tracking-wide text-slate-100 hover:text-cyan-400 transition"
+        >
+          <div className="flex items-center space-x-2">
+            <Sparkles className="w-4 h-4 text-cyan-400 animate-pulse" />
+            <span>Symmetry & Manufacturing Tolerances</span>
+          </div>
+          {isSymmetryExpanded ? <ChevronUp className="w-4 h-4 text-slate-400" /> : <ChevronDown className="w-4 h-4 text-slate-400" />}
+        </button>
+
+        {isSymmetryExpanded && (
+          <div className="mt-4 space-y-4">
+            {/* Manufacturing Tolerance Input */}
+            <div className="space-y-1.5 bg-slate-950 p-3 rounded border border-slate-850">
+              <div className="flex justify-between text-xs font-mono">
+                <span className="text-slate-300">Mfg Tolerance Limit</span>
+                <strong className="text-cyan-400 font-bold">{toleranceMm} mm</strong>
+              </div>
+              <input
+                type="range"
+                min="5"
+                max="50"
+                step="1"
+                value={toleranceMm}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  setToleranceMm(val);
+                  onParameterChange({ symmetryTolerance: val });
+                }}
+                className="w-full accent-cyan-500 cursor-ew-resize h-1 bg-slate-800 rounded"
+              />
+              <p className="text-[9px] text-slate-400 font-sans italic leading-tight">
+                Permitted construction deviation from design center-line under IMO standards.
+              </p>
+            </div>
+
+            {/* Simulated Alignment Scan Input */}
+            <div className="space-y-1.5 bg-slate-950 p-3 rounded border border-slate-850">
+              <div className="flex justify-between text-xs font-mono">
+                <span className="text-slate-300">Simulated Asymmetry (Laser Scan)</span>
+                <strong className={`${simulatedAsymmetryMm > toleranceMm ? 'text-rose-400 font-bold animate-pulse' : 'text-emerald-400'} font-bold`}>
+                  {simulatedAsymmetryMm} mm
+                </strong>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="60"
+                step="1"
+                value={simulatedAsymmetryMm}
+                onChange={(e) => {
+                  const val = parseInt(e.target.value, 10);
+                  setSimulatedAsymmetryMm(val);
+                  onParameterChange({ symmetryDeviation: val });
+                }}
+                className="w-full accent-cyan-500 cursor-ew-resize h-1 bg-slate-800 rounded"
+              />
+              <p className="text-[9px] text-slate-400 font-sans italic leading-tight">
+                Simulate welded plating shrinkage, plate fitting, or bulkheads alignment deviation.
+              </p>
+            </div>
+
+            {/* Run Symmetry Test button */}
+            <button
+              onClick={handleRunSymmetryCheck}
+              disabled={isChecking}
+              className={`w-full py-2 px-3 rounded text-xs font-bold uppercase tracking-wider font-mono border transition duration-200 flex items-center justify-center space-x-2 ${
+                isChecking
+                  ? 'bg-slate-950 border-slate-800 text-slate-500 cursor-not-allowed'
+                  : 'bg-cyan-950 hover:bg-cyan-900 border-cyan-800 hover:border-cyan-700 text-cyan-400'
+              }`}
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isChecking ? 'animate-spin' : ''}`} />
+              <span>{isChecking ? 'Measuring As-Built Offsets...' : 'Recalibrate & Verify Symmetry'}</span>
+            </button>
+
+            {/* Symmetry Analysis Summary */}
+            {hasChecked && (
+              <div className="bg-slate-950 p-3 rounded border border-slate-800 space-y-3">
+                <div className="flex justify-between items-center">
+                  <span className="text-xs font-semibold text-slate-200">Symmetry Test Status:</span>
+                  <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${
+                    simulatedAsymmetryMm > toleranceMm
+                      ? 'bg-rose-500/10 text-rose-400 border-rose-500/20'
+                      : 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                  }`}>
+                    {simulatedAsymmetryMm > toleranceMm ? 'FAILED (EXCEEDS LIMIT)' : 'PASSED'}
+                  </span>
+                </div>
+
+                {/* SVG Visual Alignment Display */}
+                <div className="h-[120px] bg-slate-900 rounded border border-slate-850 relative overflow-hidden p-2 flex flex-col justify-between">
+                  <div className="text-[8px] font-mono text-slate-500 uppercase flex justify-between">
+                    <span>PORT (-)</span>
+                    <span>BODY PLAN CL ALIGNMENT</span>
+                    <span>STBD (+)</span>
+                  </div>
+
+                  {/* SVG Centerline Visualization */}
+                  <div className="flex-1 w-full relative">
+                    <svg className="w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
+                      {/* Design Centerline (Dashed gray) */}
+                      <line x1="50" y1="5" x2="50" y2="95" stroke="#475569" strokeWidth="1" strokeDasharray="3 3" />
+                      
+                      {/* As-Built Centerline (Green if passed, Red if failed) */}
+                      {(() => {
+                        const shift = (simulatedAsymmetryMm / 60) * 35; // scale factor
+                        const color = simulatedAsymmetryMm > toleranceMm ? '#f43f5e' : '#10b981';
+                        // Draw a curved centerline to represent a warped frame
+                        const dPath = `M 50 5 Q ${50 + shift} 50 50 95`;
+                        return (
+                          <>
+                            <path d={dPath} fill="none" stroke={color} strokeWidth="2.5" className={simulatedAsymmetryMm > toleranceMm ? "animate-pulse" : ""} />
+                            {simulatedAsymmetryMm > 0 && (
+                              <>
+                                {/* Double-headed arrow / bracket representing maximum deviation at midship */}
+                                <line x1="50" y1="50" x2={50 + shift} y2="50" stroke={color} strokeWidth="1" />
+                                <circle cx={50 + shift} cy="50" r="2.5" fill={color} />
+                              </>
+                            )}
+                          </>
+                        );
+                      })()}
+                    </svg>
+                    {/* Floating label for Max Deviation */}
+                    <div className="absolute top-[40%] left-[54%] text-[9px] font-mono font-bold leading-none bg-slate-950/80 px-1 py-0.5 rounded border border-slate-850" style={{
+                      transform: 'translateY(-50%)',
+                      color: simulatedAsymmetryMm > toleranceMm ? '#f43f5e' : '#10b981'
+                    }}>
+                      Max Dev: {simulatedAsymmetryMm}mm
+                    </div>
+                  </div>
+
+                  <div className="text-[8px] font-mono text-center text-slate-500">
+                    {simulatedAsymmetryMm > toleranceMm 
+                      ? "⚠️ CENTERLINE WARP EXCEEDS MANUFACTURING TOLERANCE"
+                      : "✓ CENTERLINE WITHIN DESIGN TOLERANCE"}
+                  </div>
+                </div>
+
+                <div className="space-y-1.5 text-[11px] font-mono text-slate-400">
+                  <div className="flex justify-between">
+                    <span>Average Bias (Mean):</span>
+                    <strong className="text-slate-200">{((2 / Math.PI) * simulatedAsymmetryMm).toFixed(1)} mm</strong>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Variance (Std.Dev):</span>
+                    <strong className="text-slate-200">{(Math.sqrt(0.5) * simulatedAsymmetryMm).toFixed(1)} mm</strong>
+                  </div>
+                  <div className="flex justify-between">
+                    <span>Critical Station (Midship St.5):</span>
+                    <strong className={simulatedAsymmetryMm > toleranceMm ? 'text-rose-400 font-bold' : 'text-slate-200'}>
+                      {simulatedAsymmetryMm.toFixed(1)} mm
+                    </strong>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>
